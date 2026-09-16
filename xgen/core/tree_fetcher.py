@@ -47,6 +47,7 @@ class TreeFetchWorker(QObject):
         try:
             # 1. Fetch raw XML from active Appium session
             raw_xml = self.session_manager.get_source(timeout_seconds=self.config.source_fetch_timeout_seconds)
+
             if self._is_cancelled:
                 self.failed.emit("Tree fetch cancelled.")
                 return

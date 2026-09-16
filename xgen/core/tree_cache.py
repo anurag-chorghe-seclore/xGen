@@ -75,7 +75,7 @@ class TreeCacheStore:
         """Retrieve cache for the currently active window."""
         self._lock.lockForRead()
         try:
-            if self._active_handle and self._active_handle in self._caches:
+            if self._active_handle in self._caches:
                 return self._caches[self._active_handle]
             # Fallback to first available cache if active handle not found
             if self._caches:

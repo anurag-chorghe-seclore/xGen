@@ -220,6 +220,15 @@ class SessionManager(QObject):
 
         self._set_state(SessionState.DISCONNECTED)
 
+    def reconnect(self, config: Optional[XGenConfig] = None) -> None:
+        """Disconnect active session (if any) and connect with specified or current config."""
+        cfg = config or self.current_config
+        if not cfg:
+            logger.warning("No configuration available to reconnect.")
+            return
+        self.disconnect()
+        self.connect(cfg)
+
     def switch_window(self, handle: str) -> None:
         """Asynchronously switch active window context in session."""
         if not self._session_id:
@@ -246,6 +255,10 @@ class SessionManager(QObject):
     @property
     def session_id(self) -> Optional[str]:
         return self._session_id
+
+    @property
+    def is_connected(self) -> bool:
+        return self.state == SessionState.CONNECTED and bool(self._session_id)
 
     @property
     def base_url(self) -> str:
@@ -299,7 +312,15 @@ class SessionManager(QObject):
         app_target = config.app_path.strip()
         app_window = config.app_top_level_window.strip()
 
-        # 1. First check if an active session already exists on the server
+        # 1. First wait for any in-flight session deletion thread to finish before touching server
+        if self._delete_thread and self._delete_thread.is_alive():
+            logger.debug("Waiting for previous session deletion to complete...")
+            self._delete_thread.join(timeout=4.0)
+            time.sleep(0.2)
+
+        # 2. Check if an active session already exists on the server
+        from xgen.utils.window_finder import get_open_windows, normalize_handle
+
         try:
             r_sessions = self._http_session.get(f"{base}/sessions", timeout=2.0)
             if r_sessions.status_code == 200:
@@ -311,11 +332,16 @@ class SessionManager(QObject):
                     if sid:
                         caps = first_sess.get("capabilities", {})
                         existing_app = (caps.get("appium:app") or caps.get("app") or "").strip()
+                        existing_window_cap = (
+                            caps.get("appium:appTopLevelWindow")
+                            or caps.get("appTopLevelWindow")
+                            or ""
+                        )
 
                         # Determine if reuse is appropriate
                         user_wants_root = not app_target and not app_window
                         existing_is_root = existing_app in ("Root", "", "root")
-                        existing_is_window = bool(caps.get("appium:appTopLevelWindow"))
+                        existing_is_window = bool(existing_window_cap)
 
                         try:
                             same_app = (
@@ -326,19 +352,37 @@ class SessionManager(QObject):
                         except (OSError, ValueError):
                             same_app = existing_app == app_target
 
+                        same_window = (
+                            bool(app_window)
+                            and existing_is_window
+                            and normalize_handle(existing_window_cap) == normalize_handle(app_window)
+                        )
+
                         should_reuse = (
                             (user_wants_root and existing_is_root)
                             or same_app
-                            or (app_window and existing_is_window and caps.get("appium:appTopLevelWindow") == app_window)
+                            or same_window
                         )
 
                         if should_reuse:
                             logger.info("Reusing compatible Appium session: %s (app: %s)", sid, existing_app or "Root")
                             self._session_id = str(sid)
                             windows = self._refresh_handles_internal()
-                            active_handle = windows[0].handle if windows else ""
+                            active_handle = app_window or (windows[0].handle if windows else "")
+
                             app_name = existing_app or "Active Session"
-                            if app_name not in ("Root", "") and "\\" in app_name:
+                            if app_window:
+                                try:
+                                    norm_target = normalize_handle(app_window)
+                                    for w in get_open_windows():
+                                        if w.hwnd and normalize_handle(w.hwnd) == norm_target:
+                                            app_name = w.title or w.exe_name or f"Window {app_window}"
+                                            break
+                                    else:
+                                        app_name = f"Window {app_window}"
+                                except Exception:
+                                    app_name = f"Window {app_window}"
+                            elif app_name not in ("Root", "") and "\\" in app_name:
                                 app_name = Path(app_name).stem
 
                             return SessionInfo(
@@ -350,9 +394,14 @@ class SessionManager(QObject):
                             )
                         else:
                             logger.info(
-                                "Existing session %s targets different app (%s). Creating new session for: %s.",
+                                "Existing session %s targets different app (%s). Deleting old session and creating new session for: %s.",
                                 sid, existing_app or "Root", app_target or app_window or "Root"
                             )
+                            try:
+                                self._http_session.delete(f"{base}/session/{sid}", timeout=5.0)
+                                time.sleep(0.3)
+                            except Exception as del_err:
+                                logger.warning("Could not delete old incompatible session %s: %s", sid, del_err)
         except Exception as e:
             logger.debug("Active sessions query note: %s", e)
 
@@ -370,17 +419,33 @@ class SessionManager(QObject):
         app_name = "Desktop Root"
         if app_window:
             w3c_caps["appium:appTopLevelWindow"] = app_window
-            app_name = f"Window {app_window}"
+            try:
+                norm_target = normalize_handle(app_window)
+                for w in get_open_windows():
+                    if w.hwnd and normalize_handle(w.hwnd) == norm_target:
+                        app_name = w.title or w.exe_name or f"Window {app_window}"
+                        break
+                else:
+                    app_name = f"Window {app_window}"
+            except Exception:
+                app_name = f"Window {app_window}"
         else:
             w3c_caps["appium:app"] = app_target
-            if app_target != "Root":
+            if app_target and app_target != "Root":
                 app_name = Path(app_target).stem
+
+        # Add non-prefixed desiredCapabilities for JSONWP / standalone WinAppDriver
+        jsonwp_caps = dict(w3c_caps)
+        for k, v in list(w3c_caps.items()):
+            if k.startswith("appium:"):
+                jsonwp_caps[k[7:]] = v
 
         payload = {
             "capabilities": {
                 "alwaysMatch": w3c_caps,
                 "firstMatch": [{}]
-            }
+            },
+            "desiredCapabilities": jsonwp_caps
         }
 
         logger.info("Connecting to Appium at %s with payload: %s", base, payload)
@@ -409,7 +474,10 @@ class SessionManager(QObject):
 
         # Retrieve initial window handles
         windows = self._refresh_handles_internal()
-        active_handle = windows[0].handle if windows else ""
+        if not app_window and (not app_target or app_target == "Root"):
+            active_handle = ""
+        else:
+            active_handle = app_window or (windows[0].handle if windows else "")
 
         info = SessionInfo(
             session_id=sid,

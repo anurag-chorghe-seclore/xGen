@@ -19,6 +19,8 @@ except ImportError:
     win32api = None        # type: ignore
     HAS_PYWIN32 = False
 
+import uiautomation as auto
+
 from xgen.core.tree_cache import TreeCacheStore
 from xgen.core.tree_parser import TreeParser, UINode
 from xgen.core.uia_bridge import UIABridge, UIAElement
@@ -33,6 +35,7 @@ class TransientCapturer(QObject):
     Orchestrates transient and ephemeral UI capture across all 4 mechanisms.
     """
     transient_captured = pyqtSignal(object)       # UINode (merged transient root)
+    transient_failed = pyqtSignal(str)            # Failure reason
     timed_capture_tick = pyqtSignal(int)          # seconds remaining
     freeze_state_changed = pyqtSignal(bool)       # True=frozen, False=live
 
@@ -76,17 +79,31 @@ class TransientCapturer(QObject):
             ctrl = auto.ControlFromPoint(cursor_x, cursor_y)
             if ctrl is None:
                 logger.warning("F4: No control found under cursor.")
+                self.transient_failed.emit("No control found under cursor.")
                 return
+
+            if getattr(ctrl, "Name", "") == "Desktop" or getattr(ctrl, "ClassName", "") == "#32769":
+                logger.info("F4: Cursor is over desktop background.")
+                self.transient_failed.emit("Cursor is over desktop background. Hover over an application element.")
+                return
+
+            SPECIFIC_TRANSIENT = {"Menu", "ToolTip", "Popup", "Flyout", "MenuItem"}
 
             # Walk up to the topmost transient container (popup window or menu)
             top_transient = ctrl
             curr = ctrl
             while curr:
                 ct = curr.ControlTypeName.replace("Control", "")
-                if ct in self.TRANSIENT_TYPES:
+                if ct in SPECIFIC_TRANSIENT:
                     top_transient = curr
                 parent = curr.GetParentControl()
-                if parent and parent.Name == "Desktop":
+                if not parent or getattr(parent, "Name", "") == "Desktop":
+                    class_name = getattr(curr, "ClassName", "")
+                    if class_name in ("#32768", "tooltips_class32") or "Popup" in class_name or "DropDown" in class_name:
+                        top_transient = curr
+                    break
+                parent_ct = parent.ControlTypeName.replace("Control", "")
+                if parent_ct == "Window" and ct not in SPECIFIC_TRANSIENT:
                     break
                 curr = parent
 
@@ -105,8 +122,11 @@ class TransientCapturer(QObject):
                 TreeCacheStore.instance().merge_transient(active_handle, transient_root)
                 self.transient_captured.emit(transient_root)
                 logger.info("F4: Successfully captured %d transient elements.", len(elements))
+            else:
+                self.transient_failed.emit("No UI elements found under cursor.")
         except Exception as e:
             logger.exception("F4 Freeze Snapshot error: %s", e)
+            self.transient_failed.emit(f"Capture failed: {e}")
 
     # --- Mechanism 2: Timed Countdown Capture ---
 

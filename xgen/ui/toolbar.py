@@ -1,11 +1,11 @@
 """
 xGen Main Toolbar Widget.
-Provides session indicator, window switcher, tree refresh, inspect toggle, freeze toggle, and timed capture triggers.
+Provides session indicator, window switcher, tree refresh, inspect toggle, freeze toggle, timed capture triggers, and custom XPath input.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QToolBar,
     QWidget,
@@ -88,10 +89,11 @@ class Toolbar(QToolBar):
     refresh_requested = pyqtSignal()
     inspect_toggled = pyqtSignal(bool)
     window_switched = pyqtSignal(str)          # handle
-    freeze_toggled = pyqtSignal(bool)
+    export_xml_requested = pyqtSignal()        # export raw XML page source
     timed_capture_start = pyqtSignal(int)      # delay seconds
     pin_toggled = pyqtSignal(bool)             # always on top
     legend_requested = pyqtSignal()            # open XPath legend guide dialog
+    custom_xpath_test = pyqtSignal(str)        # user-entered XPath string
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__("Main Toolbar", parent)
@@ -139,7 +141,7 @@ class Toolbar(QToolBar):
         self.combo_windows = QComboBox()
         self.combo_windows.setFixedHeight(26)
         self.combo_windows.setFixedWidth(222)
-        self.combo_windows.setToolTip("Switch active window inspection target")
+        self.combo_windows.setToolTip("Switch active window inspection target\n(Note: Switching to an app needs Refresh to update UI tree)")
         self.combo_windows.setStyleSheet(
             "QComboBox { background: #181c24; color: #f1f5f9; border: 1px solid #2a3140; border-radius: 6px; padding: 1px 10px; font-size: 11px; }"
             "QComboBox:hover { border-color: #3b82f6; }"
@@ -192,20 +194,7 @@ class Toolbar(QToolBar):
         self.btn_inspect.toggled.connect(self._on_inspect_clicked)
         center_layout.addWidget(self.btn_inspect)
 
-        # 2c. Freeze Tree Toggle (F4 snapshot)
-        self.btn_freeze = QPushButton("🔒 Freeze")
-        self.btn_freeze.setFixedHeight(26)
-        self.btn_freeze.setCheckable(True)
-        self.btn_freeze.setToolTip("Freeze UI tree snapshot (F4 for instant hover capture)")
-        self.btn_freeze.setStyleSheet(
-            "QPushButton { background: #181c24; color: #cbd5e1; border: 1px solid #2a3140; border-radius: 6px; padding: 2px 11px 3px 11px; font-size: 11px; font-weight: 500; text-align: center; }"
-            "QPushButton:hover { background: #222834; color: #ffffff; border-color: #f59e0b; }"
-            "QPushButton:checked { background: #451a03; color: #fbbf24; border-color: #f59e0b; font-weight: 600; }"
-        )
-        self.btn_freeze.toggled.connect(self.freeze_toggled.emit)
-        center_layout.addWidget(self.btn_freeze)
-
-        # 2d. Timed Capture Button
+        # 2c. Timed Capture Button
         self.btn_timed = QPushButton("⏱ 5s")
         self.btn_timed.setFixedHeight(26)
         self.btn_timed.setToolTip("Set 5-second countdown to interact with app before auto-capture")
@@ -216,7 +205,7 @@ class Toolbar(QToolBar):
         self.btn_timed.clicked.connect(lambda: self.timed_capture_start.emit(5))
         center_layout.addWidget(self.btn_timed)
 
-        # 2e. Pin on Top (Always on Top) Toggle
+        # 2d. Pin on Top (Always on Top) Toggle
         self.btn_pin = QPushButton("📌 Pin")
         self.btn_pin.setFixedHeight(26)
         self.btn_pin.setCheckable(True)
@@ -231,19 +220,44 @@ class Toolbar(QToolBar):
 
         layout.addWidget(self.center_container)
 
-        # Space after center buttons
+        # Space after center buttons to preserve center alignment
         layout.addStretch(1)
 
-        # === 3. Right Section: Pinned XPath Guide ===
-        self.btn_legend = QPushButton("📖 Guide")
-        self.btn_legend.setFixedHeight(26)
-        self.btn_legend.setToolTip("Open XPath Guide: Badges, Loc Risk, Stability Scores, and Tiers")
-        self.btn_legend.setStyleSheet(
-            "QPushButton { background: #181c24; color: #60a5fa; border: 1px solid #2e384d; border-radius: 6px; padding: 2px 13px 3px 13px; font-size: 11px; font-weight: 600; text-align: center; }"
-            "QPushButton:hover { background: #1e293b; color: #93c5fd; border-color: #3b82f6; }"
+        # === 3. Right Section: Test XPath Button & Overflow Menu ===
+        self.btn_test_xpath = QPushButton("🧪 Test XPath")
+        self.btn_test_xpath.setFixedHeight(26)
+        self.btn_test_xpath.setToolTip(
+            "Open XPath tester: enter an XPath, match against cached tree or Appium,\n"
+            "then Click / Hover / Type on the found element."
         )
-        self.btn_legend.clicked.connect(self.legend_requested.emit)
-        layout.addWidget(self.btn_legend)
+        self.btn_test_xpath.setStyleSheet(
+            "QPushButton { background: #1e1545; color: #a78bfa; border: 1px solid #4c1d95; border-radius: 6px;"
+            "              padding: 2px 12px 3px 12px; font-size: 11px; font-weight: 600; text-align: center; }"
+            "QPushButton:hover { background: #2e1065; color: #c4b5fd; border-color: #7c3aed; }"
+            "QPushButton:pressed { background: #3b0764; }"
+        )
+        self.btn_test_xpath.clicked.connect(self._on_test_xpath_clicked)
+        layout.addWidget(self.btn_test_xpath)
+
+        # === 4. Right Section: Three-Dot Overflow Menu (Export XML, Guide) ===
+        self.btn_overflow = QPushButton("⋯")
+        self.btn_overflow.setFixedHeight(26)
+        self.btn_overflow.setFixedWidth(28)
+        self.btn_overflow.setToolTip("More options (Export XML, XPath Guide)")
+        self.btn_overflow.setStyleSheet(
+            "QPushButton { background: #181c24; color: #94a3b8; border: 1px solid #2a3140; border-radius: 6px;"
+            "              font-size: 14px; font-weight: bold; text-align: center; padding-bottom: 2px; }"
+            "QPushButton:hover { background: #222834; color: #ffffff; border-color: #3b82f6; }"
+            "QPushButton:pressed { background: #1a202c; }"
+        )
+        self.btn_overflow.clicked.connect(self._on_overflow_clicked)
+        layout.addSpacing(4)
+        layout.addWidget(self.btn_overflow)
+        layout.addSpacing(2)
+
+        # Compatibility aliases for tests
+        self.btn_export_xml = self.btn_overflow
+        self.btn_legend = self.btn_overflow
 
         self.addWidget(container)
 
@@ -316,15 +330,44 @@ class Toolbar(QToolBar):
                 hover_border="#ef4444"
             )
 
-    def update_windows_list(self, windows: List[WindowInfo]) -> None:
+    def update_windows_list(self, windows: List[Any], selected_handle: Optional[str] = None) -> None:
+        from xgen.utils.window_finder import normalize_handle
+
+        curr_handle = selected_handle
+        if (curr_handle is None or curr_handle == "") and self.combo_windows.count() > 0:
+            curr_data = self.combo_windows.currentData()
+            if curr_data:
+                curr_handle = str(curr_data)
+
         self.combo_windows.blockSignals(True)
         self.combo_windows.clear()
 
+        norm_curr = normalize_handle(curr_handle)
+
         active_idx = 0
         for idx, w in enumerate(windows):
-            title = w.title or f"Window {w.handle}"
-            self.combo_windows.addItem(f"🪟 {title}", w.handle)
-            if w.is_active:
+            if hasattr(w, "display_label"):
+                label = w.display_label()
+                handle = getattr(w, "handle_hex", "")
+                hwnd = getattr(w, "hwnd", 0)
+                is_active = False
+            else:
+                title = getattr(w, "title", "") or f"Window {getattr(w, 'handle', '')}"
+                label = f"🪟 {title}"
+                handle = getattr(w, "handle", "")
+                hwnd = 0
+                is_active = getattr(w, "is_active", False)
+
+            self.combo_windows.addItem(label, handle)
+
+            norm_h = normalize_handle(handle) if handle else (hwnd if hwnd else None)
+            if norm_curr is not None:
+                if norm_h == norm_curr:
+                    active_idx = idx
+            elif curr_handle is not None and str(curr_handle).lower() in ("", "root"):
+                if norm_h is None:
+                    active_idx = idx
+            elif is_active:
                 active_idx = idx
 
         if windows:
@@ -362,12 +405,109 @@ class Toolbar(QToolBar):
                 self.btn_inspect.setText("🎯 Inspect (F3)")
         self.btn_inspect.blockSignals(False)
 
+    def set_timed_countdown(self, seconds_left: int) -> None:
+        """Update timed capture button during countdown and execution."""
+        self.btn_timed.blockSignals(True)
+        if seconds_left > 0:
+            self.btn_timed.setText(f"⏱ {seconds_left}s...")
+            self.btn_timed.setEnabled(False)
+            self.btn_timed.setStyleSheet(
+                "QPushButton { background: #1e1b4b; color: #a5b4fc; border: 1px solid #6366f1; border-radius: 6px; padding: 2px 11px 3px 11px; font-size: 11px; font-weight: 600; text-align: center; }"
+            )
+        else:
+            self.btn_timed.setText("⏱ Capturing...")
+            self.btn_timed.setEnabled(False)
+            self.btn_timed.setStyleSheet(
+                "QPushButton { background: #312e81; color: #c7d2fe; border: 1px solid #818cf8; border-radius: 6px; padding: 2px 11px 3px 11px; font-size: 11px; font-weight: 600; text-align: center; }"
+            )
+        self.btn_timed.blockSignals(False)
+
+    def reset_timed_button(self) -> None:
+        """Reset timed capture button back to idle state."""
+        self.btn_timed.blockSignals(True)
+        self.btn_timed.setText("⏱ 5s")
+        self.btn_timed.setEnabled(True)
+        self.btn_timed.setStyleSheet(
+            "QPushButton { background: #181c24; color: #cbd5e1; border: 1px solid #2a3140; border-radius: 6px; padding: 2px 11px 3px 11px; font-size: 11px; font-weight: 500; text-align: center; }"
+            "QPushButton:hover { background: #222834; color: #ffffff; border-color: #3b82f6; }"
+        )
+        self.btn_timed.blockSignals(False)
+
+    def set_refreshing(self, refreshing: bool) -> None:
+        """Update refresh button state, text, style, and enabled flag during tree fetch."""
+        self.btn_refresh.blockSignals(True)
+        if refreshing:
+            self.btn_refresh.setText("🔄 Refreshing...")
+            self.btn_refresh.setEnabled(False)
+            self.btn_refresh.setToolTip("Fetching fresh UI tree snapshot from target...")
+            self.btn_refresh.setStyleSheet(
+                "QPushButton { background: #1e2433; color: #60a5fa; border: 1px solid #3b82f6; border-radius: 6px;"
+                "              padding: 2px 11px 3px 11px; font-size: 11px; font-weight: 600; text-align: center; }"
+            )
+        else:
+            self.btn_refresh.setText("🔄 Refresh")
+            self.btn_refresh.setEnabled(True)
+            self.btn_refresh.setToolTip("Fetch fresh UI tree snapshot (Ctrl+R)")
+            self.btn_refresh.setStyleSheet(
+                "QPushButton { background: #181c24; color: #cbd5e1; border: 1px solid #2a3140; border-radius: 6px;"
+                "              padding: 2px 11px 3px 11px; font-size: 11px; font-weight: 500; text-align: center; }"
+                "QPushButton:hover { background: #222834; color: #ffffff; border-color: #3b82f6; }"
+            )
+        self.btn_refresh.blockSignals(False)
+
     def _on_inspect_clicked(self, checked: bool) -> None:
         self.set_inspect_active(checked)
         self.inspect_toggled.emit(checked)
 
+    def _on_test_xpath_clicked(self) -> None:
+        """Emit signal to open the XPath tester popover dialog."""
+        self.custom_xpath_test.emit("")
+
     def _on_window_selected(self, index: int) -> None:
         if index >= 0:
             handle = self.combo_windows.itemData(index)
-            if handle:
+            if handle is not None:
                 self.window_switched.emit(str(handle))
+
+    def _on_overflow_clicked(self) -> None:
+        """Show overflow dropdown menu containing Export XML and XPath Guide."""
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu {"
+            "    background-color: #14171e;"
+            "    color: #cbd5e1;"
+            "    border: 1px solid #28303f;"
+            "    border-radius: 6px;"
+            "    padding: 4px;"
+            "    font-size: 11px;"
+            "}"
+            "QMenu::item {"
+            "    padding: 6px 20px 6px 12px;"
+            "    border-radius: 4px;"
+            "}"
+            "QMenu::item:selected {"
+            "    background-color: #2563eb;"
+            "    color: #ffffff;"
+            "}"
+            "QMenu::separator {"
+            "    height: 1px;"
+            "    background: #28303f;"
+            "    margin: 4px 6px;"
+            "}"
+        )
+
+        act_export = menu.addAction("📤 Export XML")
+        act_export.setToolTip("Export current raw XML page source to ./output/ directory")
+        act_export.triggered.connect(self.export_xml_requested.emit)
+
+        menu.addSeparator()
+
+        act_guide = menu.addAction("📖 XPath Guide")
+        act_guide.setToolTip("Open XPath Guide: Badges, Loc Risk, Stability Scores, and Tiers")
+        act_guide.triggered.connect(self.legend_requested.emit)
+
+        # Align popup menu with right edge of overflow button
+        pos = self.btn_overflow.mapToGlobal(self.btn_overflow.rect().bottomRight())
+        pos.setX(pos.x() - menu.sizeHint().width())
+        pos.setY(pos.y() + 2)
+        menu.exec(pos)

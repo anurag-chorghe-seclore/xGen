@@ -81,3 +81,67 @@ def test_bridge_live_fallback_for_missing_element(sample_cache):
     assert res.is_live_fallback is True
     assert res.node.tag == "ListItem"
     assert res.node.name == "Row 500"
+
+
+def test_bridge_rejects_reused_runtime_id_with_disjoint_bounds(sample_cache):
+    bridge = ElementBridge()
+    # Live UIA element at row 5 shares virtualized RuntimeId with row 11 (Cancel button at [260,200][410,230])
+    # but its physical coordinates are completely disjoint ([100, 600][250, 630])
+    uia_el = UIAElement(
+        runtime_id="42.102",  # Cancel button's RuntimeId in sample_cache
+        control_type="Button",
+        name="Submit",
+        bounding_rect=Rect(100, 600, 250, 630)
+    )
+
+    # RuntimeId match must be rejected because bounds don't overlap, falling back to uia_fallback
+    res = bridge.find_node(uia_el, sample_cache, click_x=150, click_y=615)
+    assert res.method != "runtime_id"
+    assert res.is_live_fallback is True
+
+
+def test_bridge_fuzzy_rect_matching(sample_cache):
+    bridge = ElementBridge()
+    # Slightly offset bounding rect (within ±4px due to DPI / subpixel rounding)
+    # XML Cancel button is at [260,200][410,230]
+    uia_el = UIAElement(
+        runtime_id="",
+        control_type="Button",
+        name="Cancel",
+        bounding_rect=Rect(262, 199, 408, 231)
+    )
+
+    res = bridge.find_node(uia_el, sample_cache)
+    assert res.node is not None
+    assert res.method == "bounding_rect"
+    assert res.node.automation_id == "btn_cancel"
+
+
+def test_bridge_inner_leaf_matches_interactive_container_at_point():
+    xml = """
+    <AppiumAUT>
+      <Window Name="Explorer" BoundingRectangle="[0,0][1000,800]">
+        <ListItem Name=".venv" BoundingRectangle="[100,300][400,330]"/>
+      </Window>
+    </AppiumAUT>
+    """
+    root = TreeParser.parse(xml)
+    lxml_tree = etree.fromstring(xml.encode())
+    cache = WindowTreeCache("0x0001", xml, root, lxml_tree)
+
+    bridge = ElementBridge()
+    # Live element is an inner Edit with a reused/virtualized runtime id
+    uia_el = UIAElement(
+        runtime_id="4824.803041200.0",
+        control_type="Edit",
+        name="Name",
+        bounding_rect=Rect(120, 305, 200, 325)
+    )
+
+    # Point-containment at (150, 315) should resolve to ListItem[.venv]
+    res = bridge.find_node(uia_el, cache, click_x=150, click_y=315)
+    assert res.node is not None
+    assert res.node.tag == "ListItem"
+    assert res.node.name == ".venv"
+    assert res.method == "point_containment"
+

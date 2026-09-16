@@ -47,3 +47,4 @@ def test_tree_fetcher_full_cycle(qapp):
 
     fetcher.close()
     mgr.close()
+

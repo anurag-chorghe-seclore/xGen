@@ -48,7 +48,7 @@ class DriverRunner(QObject):
         super().__init__(parent)
         self.session_manager = session_manager
         import threading
-        self._driver_lock = threading.Lock()
+        self._driver_lock = threading.RLock()
 
     def async_test_xpath(self, xpath: str, card: object = None) -> None:
         """Asynchronously test selector on worker thread and emit test_finished on main thread."""
@@ -73,7 +73,7 @@ class DriverRunner(QObject):
         import threading
         threading.Thread(target=lambda: self.send_keys_xpath(xpath, text), daemon=True).start()
 
-    def test_xpath(self, xpath: str) -> TestElementResult:
+    def test_xpath(self, xpath: str, timeout: float = 12.0) -> TestElementResult:
         """
         Queries Appium POST /session/{id}/element with the given XPath.
         Returns TestElementResult with elapsed time and rect if found.
@@ -92,7 +92,7 @@ class DriverRunner(QObject):
         with self._driver_lock:
             t0 = time.perf_counter()
             try:
-                r = self.session_manager.http_session.post(url, json=payload, timeout=20.0)
+                r = self.session_manager.http_session.post(url, json=payload, timeout=timeout)
                 elapsed = (time.perf_counter() - t0) * 1000.0
 
                 if r.status_code == 200:

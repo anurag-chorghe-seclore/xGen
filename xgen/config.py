@@ -33,6 +33,7 @@ class XGenConfig:
     auto_detect_new_windows: bool = True
     auto_connect_on_startup: bool = True
     confirm_disconnect: bool = True
+    confirm_reconnect_switch: bool = True
 
     tree_stale_warning_seconds: int = 60
     source_fetch_timeout_seconds: int = 60
@@ -99,6 +100,7 @@ class ConfigManager:
                 auto_detect_new_windows=bool(data.get("auto_detect_new_windows", True)),
                 auto_connect_on_startup=bool(data.get("auto_connect_on_startup", True)),
                 confirm_disconnect=bool(data.get("confirm_disconnect", True)),
+                confirm_reconnect_switch=bool(data.get("confirm_reconnect_switch", True)),
                 tree_stale_warning_seconds=int(data.get("tree_stale_warning_seconds", 60)),
                 source_fetch_timeout_seconds=int(data.get("source_fetch_timeout_seconds", 60)),
                 session_connect_timeout_seconds=int(data.get("session_connect_timeout_seconds", 90)),

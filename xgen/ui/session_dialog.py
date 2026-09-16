@@ -16,7 +16,6 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -28,6 +27,7 @@ from PyQt6.QtWidgets import (
 
 from xgen.config import ConfigManager, RecentSession, XGenConfig
 from xgen.core.session_manager import SessionManager
+from xgen.utils.window_finder import WindowTarget, get_open_windows, normalize_handle
 
 
 class PingWorker(QObject):
@@ -68,7 +68,7 @@ class SessionDialog(QDialog):
             QDialog { background: #0f1115; color: #f1f5f9; font-family: 'Segoe UI', system-ui, sans-serif; }
             QFrame#card { background-color: #14171e; border: 1px solid #232834; border-radius: 8px; }
             QLabel#section_title { color: #60a5fa; font-size: 10px; font-weight: 700; letter-spacing: 0.6px; margin-top: 4px; }
-            QRadioButton { color: #cbd5e1; font-size: 11px; spacing: 8px; padding: 3px 0; }
+            QRadioButton { color: #cbd5e1; font-size: 11px; spacing: 8px; padding: 3px 0; font-weight: 500; }
             QRadioButton::indicator { width: 14px; height: 14px; border-radius: 7px; border: 1px solid #475569; background: #181c24; }
             QRadioButton::indicator:hover { border-color: #3b82f6; }
             QRadioButton::indicator:checked { width: 14px; height: 14px; border-radius: 7px; border: 1px solid #3b82f6; background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5, stop:0 #3b82f6, stop:0.55 #3b82f6, stop:0.6 #181c24, stop:1.0 #181c24); }
@@ -80,12 +80,14 @@ class SessionDialog(QDialog):
             QLabel:disabled { color: #475569; }
             QComboBox { background: #181c24; color: #f1f5f9; border: 1px solid #2a3140; border-radius: 6px; padding: 6px 10px; font-size: 11px; }
             QComboBox:hover { border-color: #3b82f6; }
+            QComboBox:disabled { background: #111317; color: #475569; border-color: #1e222b; }
             QComboBox QAbstractItemView { background: #14171e; color: #cbd5e1; selection-background-color: #2563eb; selection-color: #ffffff; border: 1px solid #28303f; border-radius: 6px; padding: 4px; outline: none; }
             QComboBox QAbstractItemView::item { min-height: 24px; padding: 4px 10px; border-radius: 4px; border-bottom: 1px solid #1e2430; margin: 1px 0px; }
             QComboBox QAbstractItemView::item:hover { background-color: #1e2533; color: #ffffff; }
             QComboBox QAbstractItemView::item:selected { background-color: #2563eb; color: #ffffff; font-weight: 500; }
             QPushButton { background: #1e2430; color: #cbd5e1; border: 1px solid #2e384d; border-radius: 6px; padding: 6px 14px; font-size: 11px; font-weight: 500; }
             QPushButton:hover { background: #2b3548; color: #ffffff; border-color: #3b82f6; }
+            QPushButton:disabled { background: #111317; color: #475569; border-color: #1e222b; }
         """)
 
         self._init_ui()
@@ -98,63 +100,101 @@ class SessionDialog(QDialog):
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(16, 16, 16, 16)
 
-        # 1. Mode Selection Card
-        lbl_mode = QLabel("INSPECTION TARGET MODE")
-        lbl_mode.setObjectName("section_title")
-        main_layout.addWidget(lbl_mode)
+        # Radio button group for target mode
+        self.target_group = QButtonGroup(self)
 
-        mode_card = QFrame()
-        mode_card.setObjectName("card")
-        mode_layout = QVBoxLayout(mode_card)
-        mode_layout.setContentsMargins(12, 10, 12, 10)
-        mode_layout.setSpacing(6)
+        # 1. Target Window / Application Picker Card
+        lbl_target_hdr = QLabel("RUNNING WINDOW TARGET")
+        lbl_target_hdr.setObjectName("section_title")
+        main_layout.addWidget(lbl_target_hdr)
 
-        self.radio_root = QRadioButton("Desktop Root (Recommended — inspect multi-window apps like Teams/Outlook)")
-        self.radio_launch = QRadioButton("Launch Application (.exe path)")
-        self.radio_attach = QRadioButton("Attach to Running Top-Level Window (HWND)")
+        target_card = QFrame()
+        target_card.setObjectName("card")
+        target_card_layout = QVBoxLayout(target_card)
+        target_card_layout.setContentsMargins(12, 10, 12, 10)
+        target_card_layout.setSpacing(6)
 
-        self.radio_root.setChecked(True)
-        self.btn_group = QButtonGroup(self)
-        self.btn_group.addButton(self.radio_root, 1)
-        self.btn_group.addButton(self.radio_launch, 2)
-        self.btn_group.addButton(self.radio_attach, 3)
-        self.btn_group.buttonClicked.connect(self._on_mode_changed)
+        self.rb_window = QRadioButton("Attach to Running Window or Desktop Root")
+        self.rb_window.setChecked(True)
+        self.target_group.addButton(self.rb_window)
+        target_card_layout.addWidget(self.rb_window)
 
-        mode_layout.addWidget(self.radio_root)
-        mode_layout.addWidget(self.radio_launch)
-        mode_layout.addWidget(self.radio_attach)
-        main_layout.addWidget(mode_card)
+        combo_row = QHBoxLayout()
+        combo_row.setSpacing(6)
 
-        # 2. Connection Details Form Card
-        lbl_target = QLabel("TARGET CONFIGURATION")
-        lbl_target.setObjectName("section_title")
-        main_layout.addWidget(lbl_target)
+        self.combo_target = QComboBox()
+        self.combo_target.setToolTip("Select running application window or Desktop Root")
+        if self.combo_target.view() and self.combo_target.view().window():
+            self.combo_target.view().window().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.combo_target.view().window().setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+        self.combo_target.currentIndexChanged.connect(self._on_target_changed)
+        combo_row.addWidget(self.combo_target, 1)
 
-        form_card = QFrame()
-        form_card.setObjectName("card")
-        form_layout = QFormLayout(form_card)
-        form_layout.setContentsMargins(12, 10, 12, 10)
-        form_layout.setSpacing(8)
-        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.btn_refresh_targets = QPushButton("🔄 Refresh")
+        self.btn_refresh_targets.setToolTip("Scan system for newly opened windows")
+        self.btn_refresh_targets.clicked.connect(self._refresh_window_combo)
+        combo_row.addWidget(self.btn_refresh_targets)
 
-        # App path field + Browse button
+        target_card_layout.addLayout(combo_row)
+
+        self.lbl_target_badge = QLabel("Target: Desktop Root (Entire OS)")
+        self.lbl_target_badge.setStyleSheet("color: #60a5fa; font-size: 10px; font-family: monospace;")
+        target_card_layout.addWidget(self.lbl_target_badge)
+
+        main_layout.addWidget(target_card)
+
+        # 2. Launch Application Executable (.exe) Card (Replaces Recent Configurations)
+        lbl_launch_hdr = QLabel("LAUNCH APPLICATION EXECUTABLE (.EXE)")
+        lbl_launch_hdr.setObjectName("section_title")
+        main_layout.addWidget(lbl_launch_hdr)
+
+        launch_card = QFrame()
+        launch_card.setObjectName("card")
+        launch_card_layout = QVBoxLayout(launch_card)
+        launch_card_layout.setContentsMargins(12, 10, 12, 10)
+        launch_card_layout.setSpacing(6)
+
+        self.rb_launch_exe = QRadioButton("Launch New Application Process from Executable (.exe)")
+        self.target_group.addButton(self.rb_launch_exe)
+        launch_card_layout.addWidget(self.rb_launch_exe)
+
+        self.app_path_row_widget = QWidget()
+        app_path_row = QHBoxLayout(self.app_path_row_widget)
+        app_path_row.setContentsMargins(0, 0, 0, 0)
+        app_path_row.setSpacing(6)
+
         self.app_path_edit = QLineEdit()
         self.app_path_edit.setPlaceholderText("C:\\Program Files\\...\\app.exe")
-        btn_browse = QPushButton("Browse...")
-        btn_browse.clicked.connect(self._browse_app_path)
-        path_row = QHBoxLayout()
-        path_row.addWidget(self.app_path_edit)
-        path_row.addWidget(btn_browse)
-        self.lbl_app_path = QLabel("App Executable:")
-        form_layout.addRow(self.lbl_app_path, path_row)
+        self.app_path_edit.textChanged.connect(self._on_app_path_text_changed)
 
-        # Window handle field
-        self.window_handle_edit = QLineEdit()
-        self.window_handle_edit.setPlaceholderText("e.g. 0x001A0B2C or 1706796")
-        self.lbl_window_handle = QLabel("Window Handle:")
-        form_layout.addRow(self.lbl_window_handle, self.window_handle_edit)
+        self.btn_browse = QPushButton("📁 Browse...")
+        self.btn_browse.clicked.connect(self._browse_app_path)
 
-        # Appium Server URL
+        app_path_row.addWidget(self.app_path_edit, 1)
+        app_path_row.addWidget(self.btn_browse)
+        launch_card_layout.addWidget(self.app_path_row_widget)
+
+        lbl_exe_hint = QLabel("Starts a new application process from disk and connects inspection to its main window.")
+        lbl_exe_hint.setStyleSheet("color: #64748b; font-size: 10px;")
+        launch_card_layout.addWidget(lbl_exe_hint)
+
+        main_layout.addWidget(launch_card)
+
+        # Wire mutual mode toggle
+        self.rb_window.toggled.connect(self._on_mode_toggled)
+
+        # 3. Server Configuration Card
+        lbl_server_hdr = QLabel("APPIUM SERVER CONFIGURATION")
+        lbl_server_hdr.setObjectName("section_title")
+        main_layout.addWidget(lbl_server_hdr)
+
+        server_card = QFrame()
+        server_card.setObjectName("card")
+        server_layout = QFormLayout(server_card)
+        server_layout.setContentsMargins(12, 10, 12, 10)
+        server_layout.setSpacing(8)
+        server_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
         self.appium_url_edit = QLineEdit("http://127.0.0.1:4723")
         self.btn_test_url = QPushButton("Ping Status")
         self.btn_test_url.setFixedWidth(100)
@@ -162,30 +202,9 @@ class SessionDialog(QDialog):
         url_row = QHBoxLayout()
         url_row.addWidget(self.appium_url_edit)
         url_row.addWidget(self.btn_test_url)
-        form_layout.addRow("Appium URL:", url_row)
+        server_layout.addRow("Appium URL:", url_row)
 
-        main_layout.addWidget(form_card)
-
-        # 3. Recent Configurations Card
-        lbl_recent = QLabel("RECENT CONFIGURATIONS")
-        lbl_recent.setObjectName("section_title")
-        main_layout.addWidget(lbl_recent)
-
-        recent_card = QFrame()
-        recent_card.setObjectName("card")
-        recent_layout = QHBoxLayout(recent_card)
-        recent_layout.setContentsMargins(12, 10, 12, 10)
-        recent_layout.setSpacing(8)
-        self.recent_combo = QComboBox()
-        self.recent_combo.setPlaceholderText("Select a recent session...")
-        if self.recent_combo.view() and self.recent_combo.view().window():
-            self.recent_combo.view().window().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            self.recent_combo.view().window().setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
-        btn_load_recent = QPushButton("Load")
-        btn_load_recent.clicked.connect(self._load_selected_recent)
-        recent_layout.addWidget(self.recent_combo, 1)
-        recent_layout.addWidget(btn_load_recent)
-        main_layout.addWidget(recent_card)
+        main_layout.addWidget(server_card)
 
         # 4. Options / Preferences
         self.chk_confirm_disconnect = QCheckBox("Ask confirmation before disconnecting active session")
@@ -198,6 +217,17 @@ class SessionDialog(QDialog):
         """)
         self.chk_confirm_disconnect.toggled.connect(self._on_confirm_disconnect_toggled)
         main_layout.addWidget(self.chk_confirm_disconnect)
+
+        self.chk_confirm_reconnect_switch = QCheckBox("Ask confirmation before reconnecting when switching windows")
+        self.chk_confirm_reconnect_switch.setToolTip("Show a confirmation prompt when switching target window or app while connected")
+        self.chk_confirm_reconnect_switch.setStyleSheet("""
+            QCheckBox { color: #cbd5e1; font-size: 11px; padding: 2px 0; }
+            QCheckBox:hover { color: #ffffff; }
+            QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #334155; background: #181c24; }
+            QCheckBox::indicator:checked { background: #2563eb; border-color: #3b82f6; }
+        """)
+        self.chk_confirm_reconnect_switch.toggled.connect(self._on_confirm_reconnect_switch_toggled)
+        main_layout.addWidget(self.chk_confirm_reconnect_switch)
 
         # 5. Status Indicator Banner
         self.lbl_status = QLabel("Checking Appium server status...")
@@ -221,47 +251,105 @@ class SessionDialog(QDialog):
         button_row.addWidget(self.btn_connect)
         main_layout.addLayout(button_row)
 
-        self._update_field_visibility()
+    def _on_mode_toggled(self, is_window: bool) -> None:
+        self.combo_target.setEnabled(is_window)
+        self.btn_refresh_targets.setEnabled(is_window)
+        self.app_path_edit.setEnabled(not is_window)
+        self.btn_browse.setEnabled(not is_window)
+        if is_window:
+            self._on_target_changed(self.combo_target.currentIndex())
+        else:
+            self.lbl_target_badge.setText("Target: Launch new process from executable path")
+            self.lbl_target_badge.show()
+
+    def _on_app_path_text_changed(self, text: str) -> None:
+        if text.strip() and not self.rb_launch_exe.isChecked():
+            self.rb_launch_exe.setChecked(True)
+
+    def _refresh_window_combo(self) -> None:
+        """Scan top-level windows and repopulate combo, preserving current selection if possible."""
+        prev_data = self.combo_target.currentData()
+        prev_handle = prev_data.handle_hex if isinstance(prev_data, WindowTarget) else ""
+
+        self.combo_target.blockSignals(True)
+        self.combo_target.clear()
+
+        windows = get_open_windows()
+        selected_idx = 0
+        norm_prev = normalize_handle(prev_handle)
+        for idx, w in enumerate(windows):
+            self.combo_target.addItem(w.display_label(), w)
+            if norm_prev is not None and normalize_handle(w.handle_hex) == norm_prev:
+                selected_idx = idx
+
+        self.combo_target.setCurrentIndex(selected_idx)
+        self.combo_target.blockSignals(False)
+        self._on_target_changed(self.combo_target.currentIndex())
+
+    def _on_target_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        if not self.rb_window.isChecked():
+            self.rb_window.setChecked(True)
+        data = self.combo_target.itemData(index)
+        if isinstance(data, WindowTarget):
+            if data.is_root:
+                self.lbl_target_badge.setText("Target: Desktop Root (Entire OS)")
+                self.lbl_target_badge.show()
+            else:
+                exe_part = f"  |  Exe: {data.exe_name}" if data.exe_name else ""
+                self.lbl_target_badge.setText(f"HWND Handle: {data.handle_hex}{exe_part}")
+                self.lbl_target_badge.show()
+        else:
+            self.lbl_target_badge.hide()
 
     def _on_confirm_disconnect_toggled(self, checked: bool) -> None:
         self.config.confirm_disconnect = checked
         ConfigManager.save(self.config)
 
+    def _on_confirm_reconnect_switch_toggled(self, checked: bool) -> None:
+        self.config.confirm_reconnect_switch = checked
+        ConfigManager.save(self.config)
+
     def _populate_from_config(self, cfg: XGenConfig) -> None:
         self.appium_url_edit.setText(cfg.appium_url or "http://127.0.0.1:4723")
         self.app_path_edit.setText(cfg.app_path or "")
-        self.window_handle_edit.setText(cfg.app_top_level_window or "")
         self.chk_confirm_disconnect.setChecked(getattr(cfg, "confirm_disconnect", True))
+        self.chk_confirm_reconnect_switch.setChecked(getattr(cfg, "confirm_reconnect_switch", True))
 
-        if cfg.app_top_level_window:
-            self.radio_attach.setChecked(True)
-        elif cfg.app_path:
-            self.radio_launch.setChecked(True)
+        self._refresh_window_combo()
+
+        if cfg.app_path:
+            self.rb_launch_exe.setChecked(True)
+        elif cfg.app_top_level_window:
+            self.rb_window.setChecked(True)
+            matched_idx = -1
+            norm_target = normalize_handle(cfg.app_top_level_window)
+            for i in range(self.combo_target.count()):
+                d = self.combo_target.itemData(i)
+                if isinstance(d, WindowTarget) and normalize_handle(d.handle_hex) == norm_target:
+                    matched_idx = i
+                    break
+            if matched_idx >= 0:
+                self.combo_target.setCurrentIndex(matched_idx)
+            else:
+                custom_target = WindowTarget(
+                    title=f"Window {cfg.app_top_level_window} (Previous)",
+                    handle_hex=cfg.app_top_level_window,
+                    hwnd=0,
+                    exe_name=""
+                )
+                self.combo_target.insertItem(1, custom_target.display_label(), custom_target)
+                self.combo_target.setCurrentIndex(1)
         else:
-            self.radio_root.setChecked(True)
+            self.rb_window.setChecked(True)
+            self.combo_target.setCurrentIndex(0)
 
-        self._populate_recent_dropdown(cfg)
-        self._update_field_visibility()
-
-    def _populate_recent_dropdown(self, cfg: XGenConfig) -> None:
-        self.recent_combo.clear()
-        for s in cfg.recent_sessions:
-            label = f"{s.name} ({s.app_path or s.app_top_level_window or 'Root'})"
-            self.recent_combo.addItem(label, s)
-
-    def _update_field_visibility(self) -> None:
-        is_launch = self.radio_launch.isChecked()
-        is_attach = self.radio_attach.isChecked()
-
-        self.lbl_app_path.setEnabled(is_launch)
-        self.app_path_edit.setEnabled(is_launch)
-        self.lbl_window_handle.setEnabled(is_attach)
-        self.window_handle_edit.setEnabled(is_attach)
-
-    def _on_mode_changed(self) -> None:
-        self._update_field_visibility()
+        # Apply initial mode state
+        self._on_mode_toggled(self.rb_window.isChecked())
 
     def _browse_app_path(self) -> None:
+        self.rb_launch_exe.setChecked(True)
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Target Application Executable",
@@ -270,26 +358,6 @@ class SessionDialog(QDialog):
         )
         if path:
             self.app_path_edit.setText(path)
-
-    def _load_selected_recent(self) -> None:
-        idx = self.recent_combo.currentIndex()
-        if idx < 0:
-            return
-        s: RecentSession = self.recent_combo.itemData(idx)
-        if not s:
-            return
-
-        self.appium_url_edit.setText(s.appium_url)
-        self.app_path_edit.setText(s.app_path)
-        self.window_handle_edit.setText(s.app_top_level_window)
-
-        if s.app_top_level_window:
-            self.radio_attach.setChecked(True)
-        elif s.app_path:
-            self.radio_launch.setChecked(True)
-        else:
-            self.radio_root.setChecked(True)
-        self._update_field_visibility()
 
     def check_server_status(self) -> None:
         url = self.appium_url_edit.text().strip() or "http://127.0.0.1:4723"
@@ -356,29 +424,33 @@ class SessionDialog(QDialog):
         app_path = ""
         app_window = ""
 
-        if self.radio_launch.isChecked():
+        if self.rb_launch_exe.isChecked():
             app_path = self.app_path_edit.text().strip()
             if not app_path:
-                self.lbl_status.setText("⚠️ Please specify an application path.")
+                self.lbl_status.setText("⚠️ Please specify an application executable path.")
                 self.lbl_status.setStyleSheet("background: #451a03; color: #fbbf24; border: 1px solid #b45309; border-radius: 6px; padding: 6px 10px; font-weight: 600; font-size: 11px;")
                 return
-        elif self.radio_attach.isChecked():
-            app_window = self.window_handle_edit.text().strip()
-            if not app_window:
-                self.lbl_status.setText("⚠️ Please specify a top-level window handle.")
-                self.lbl_status.setStyleSheet("background: #451a03; color: #fbbf24; border: 1px solid #b45309; border-radius: 6px; padding: 6px 10px; font-weight: 600; font-size: 11px;")
-                return
+            session_name = Path(app_path).stem
         else:
-            app_path = "Root"
+            data = self.combo_target.currentData()
+            if isinstance(data, WindowTarget):
+                if data.is_root:
+                    app_path = ""
+                    session_name = "Desktop Root"
+                else:
+                    app_window = data.handle_hex
+                    session_name = data.title or f"Window {data.handle_hex}"
+            else:
+                session_name = "Desktop Root"
 
         # Update config object
         self.config.appium_url = url
-        self.config.app_path = app_path if app_path != "Root" else ""
+        self.config.app_path = app_path
         self.config.app_top_level_window = app_window
         self.config.confirm_disconnect = self.chk_confirm_disconnect.isChecked()
+        self.config.confirm_reconnect_switch = self.chk_confirm_reconnect_switch.isChecked()
 
         # Add to recents
-        session_name = Path(app_path).stem if app_path and app_path != "Root" else (f"Window {app_window}" if app_window else "Desktop Root")
         recent = RecentSession(
             name=session_name,
             app_path=self.config.app_path,

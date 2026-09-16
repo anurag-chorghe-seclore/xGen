@@ -156,7 +156,13 @@ class UIABridge(QObject):
             return None
 
     @classmethod
-    def walk_subtree(cls, root_ctrl: Optional[auto.Control] = None, root_element: Optional[UIAElement] = None, max_depth: int = 20) -> List[UIAElement]:
+    def walk_subtree(
+        cls,
+        root_ctrl: Optional[auto.Control] = None,
+        root_element: Optional[UIAElement] = None,
+        max_depth: int = 20,
+        max_elements: int = 250,
+    ) -> List[UIAElement]:
         """
         BFS traversal of element subtree using UIA RawTreeWalker.
         Used for F4 Freeze Snapshot.
@@ -175,6 +181,10 @@ class UIABridge(QObject):
 
         queue = deque([(target_ctrl, 0)])
         while queue:
+            if len(elements) >= max_elements:
+                logger.debug("walk_subtree reached max_elements limit (%d)", max_elements)
+                break
+
             curr, depth = queue.popleft()
             if depth > max_depth:
                 continue
@@ -236,3 +246,5 @@ class UIABridge(QObject):
         except Exception as e:
             logger.debug("Error converting control to element: %s", e)
             return None
+
+

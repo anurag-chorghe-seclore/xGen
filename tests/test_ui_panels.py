@@ -39,6 +39,70 @@ def test_toolbar_state_changes(qapp):
     assert "Connected to: Notepad.exe" in toolbar.btn_status_dot.toolTip()
 
 
+def test_toolbar_timed_capture_button_states(qapp):
+    toolbar = Toolbar()
+    assert toolbar.btn_timed.text() == "⏱ 5s"
+    assert toolbar.btn_timed.isEnabled() is True
+
+    toolbar.set_timed_countdown(4)
+    assert "4s" in toolbar.btn_timed.text()
+    assert toolbar.btn_timed.isEnabled() is False
+
+    toolbar.set_timed_countdown(0)
+    assert "Capturing" in toolbar.btn_timed.text()
+    assert toolbar.btn_timed.isEnabled() is False
+
+    toolbar.reset_timed_button()
+    assert toolbar.btn_timed.text() == "⏱ 5s"
+    assert toolbar.btn_timed.isEnabled() is True
+
+
+def test_toolbar_refresh_button_states(qapp):
+    toolbar = Toolbar()
+    assert toolbar.btn_refresh.text() == "🔄 Refresh"
+    assert toolbar.btn_refresh.isEnabled() is True
+
+    toolbar.set_refreshing(True)
+    assert toolbar.btn_refresh.text() == "🔄 Refreshing..."
+    assert toolbar.btn_refresh.isEnabled() is False
+
+    toolbar.set_refreshing(False)
+    assert toolbar.btn_refresh.text() == "🔄 Refresh"
+    assert toolbar.btn_refresh.isEnabled() is True
+
+
+
+def test_toolbar_update_windows_list_handle_normalization(qapp):
+    from xgen.utils.window_finder import WindowTarget
+
+    toolbar = Toolbar()
+    windows = [
+        WindowTarget(title="Desktop Root (Entire OS)", handle_hex="", hwnd=0, exe_name="", is_root=True),
+        WindowTarget(title="Calculator", handle_hex="0x000E07FA", hwnd=919546, exe_name="calc.exe"),
+        WindowTarget(title="Notepad", handle_hex="0x00020B1A", hwnd=133914, exe_name="notepad.exe"),
+    ]
+
+    # Select Calculator via padded hex
+    toolbar.update_windows_list(windows, selected_handle="0x000E07FA")
+    assert toolbar.combo_windows.currentIndex() == 1
+    assert "Calculator" in toolbar.combo_windows.currentText()
+
+    # Update with unpadded hex - should still match Calculator and NOT reset to Root
+    toolbar.update_windows_list(windows, selected_handle="0xe07fa")
+    assert toolbar.combo_windows.currentIndex() == 1
+    assert "Calculator" in toolbar.combo_windows.currentText()
+
+    # Update with decimal handle - should still match Calculator and NOT reset to Root
+    toolbar.update_windows_list(windows, selected_handle="919546")
+    assert toolbar.combo_windows.currentIndex() == 1
+    assert "Calculator" in toolbar.combo_windows.currentText()
+
+    # Update with None / empty - should PRESERVE current user selection (Calculator)
+    toolbar.update_windows_list(windows, selected_handle="")
+    assert toolbar.combo_windows.currentIndex() == 1
+    assert "Calculator" in toolbar.combo_windows.currentText()
+
+
 def test_tree_panel_and_attribute_panel_population(qapp):
     root = TreeParser.parse(SAMPLE_XML)
     btn_node = root.children[0].children[0]
@@ -110,6 +174,12 @@ def test_main_window_assembly(qapp):
     assert win.xpath_panel is not None
     assert win.toolbar is not None
     assert win.status_bar is not None
+    assert win.toolbar.combo_windows.count() >= 1
+    assert "Desktop Root" in win.toolbar.combo_windows.itemText(0)
+
+    # Test selecting target when disconnected
+    win._on_window_switched("")
+    assert "Target selected: Desktop Root" in win.status_bar.lbl_msg.text()
 
     # Test tree fetch complete handler
     root = TreeParser.parse(SAMPLE_XML)
@@ -203,6 +273,23 @@ def test_session_dialog_confirm_disconnect_setting(qapp):
         sm.close()
 
 
+def test_session_dialog_confirm_reconnect_switch_setting(qapp):
+    from xgen.ui.session_dialog import SessionDialog
+    from xgen.core.session_manager import SessionManager
+
+    sm = SessionManager()
+    try:
+        cfg = XGenConfig(confirm_reconnect_switch=True)
+        dlg = SessionDialog(cfg, sm, auto_check=False)
+        assert dlg.chk_confirm_reconnect_switch.isChecked() is True
+
+        dlg.chk_confirm_reconnect_switch.setChecked(False)
+        assert dlg.config.confirm_reconnect_switch is False
+        dlg.close()
+    finally:
+        sm.close()
+
+
 def test_main_window_pin_toggle(qapp):
     import platform
     import ctypes
@@ -253,4 +340,102 @@ def test_main_window_pin_toggle(qapp):
     win2.session_manager.close()
     win2.tree_fetcher.close()
     win2.close()
+
+
+def test_export_xml_flow(qapp):
+    from xgen.core.tree_cache import TreeCacheStore
+    TreeCacheStore.instance().clear_all()
+
+    cfg = XGenConfig(auto_connect_on_startup=False)
+    win = MainWindow(cfg, start_hooks=False)
+    try:
+        assert hasattr(win.toolbar, "btn_export_xml")
+        assert hasattr(win.toolbar, "btn_overflow")
+        assert not hasattr(win.toolbar, "btn_freeze")
+
+        # When no cache is active, status bar warns
+        win._on_export_xml()
+        assert "No page source available" in win.status_bar.lbl_msg.text()
+
+        # Populate tree cache
+        root = TreeParser.parse(SAMPLE_XML)
+        win._on_tree_fetch_complete("0x0001", SAMPLE_XML, root)
+
+        # Call export XML
+        win._on_export_xml()
+        assert "Exported page source to" in win.status_bar.lbl_msg.text()
+    finally:
+        win.session_manager.close()
+        win.tree_fetcher.close()
+        win.close()
+        TreeCacheStore.instance().clear_all()
+
+
+def test_main_window_window_switch_cancel_and_allow(qapp, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+    from xgen.core.session_manager import SessionInfo, SessionState
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr("xgen.config.ConfigManager.save", lambda cfg, path=None: None)
+    cfg = XGenConfig(auto_connect_on_startup=False, confirm_reconnect_switch=True)
+    win = MainWindow(cfg, start_hooks=False)
+    try:
+        # Mock active session
+        win.session_manager.state = SessionState.CONNECTED
+        win.session_manager._session_id = "sid-123"
+        win.session_manager.session_info = SessionInfo(
+            session_id="sid-123",
+            appium_url="http://127.0.0.1:4723",
+            app_name="App 1",
+            windows=[],
+            active_handle="0x1111"
+        )
+        win.config.app_top_level_window = "0x1111"
+
+        # Populate combo
+        win.toolbar.combo_windows.blockSignals(True)
+        win.toolbar.combo_windows.clear()
+        win.toolbar.combo_windows.addItem("Desktop Root", "")
+        win.toolbar.combo_windows.addItem("App 1 [0x1111]", "0x1111")
+        win.toolbar.combo_windows.addItem("App 2 [0x2222]", "0x2222")
+        win.toolbar.combo_windows.setCurrentIndex(1)
+        win.toolbar.combo_windows.blockSignals(False)
+
+        reconnect_mock = MagicMock()
+        monkeypatch.setattr(win.session_manager, "reconnect", reconnect_mock)
+
+        # 1. Test Cancel: should revert to index 1 (App 1) and NOT call reconnect
+        monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Cancel)
+
+        win._on_window_switched("0x2222")
+        assert reconnect_mock.call_count == 0
+        assert win.toolbar.combo_windows.currentIndex() == 1
+        assert win.toolbar.combo_windows.currentData() == "0x1111"
+
+        # 2. Test Allow with remember choice
+        def mock_exec_allow(self):
+            # simulate checking remember checkbox
+            cb = self.checkBox()
+            if cb:
+                cb.setChecked(True)
+            return QMessageBox.StandardButton.Ok
+
+        monkeypatch.setattr(QMessageBox, "exec", mock_exec_allow)
+
+        win._on_window_switched("0x2222")
+        assert reconnect_mock.call_count == 1
+        assert win.config.app_top_level_window == "0x2222"
+        assert win.config.confirm_reconnect_switch is False
+
+        # 3. Test subsequent switch with confirm_reconnect_switch == False: no prompt, instant reconnect
+        reconnect_mock.reset_mock()
+        win._on_window_switched("")
+        assert reconnect_mock.call_count == 1
+        assert win.config.app_top_level_window == ""
+    finally:
+        win.session_manager.close()
+        win.tree_fetcher.close()
+        win.close()
+
+
 

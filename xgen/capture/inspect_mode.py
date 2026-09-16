@@ -131,9 +131,9 @@ class InspectMode(QObject):
         # 2. Query live UIA element with child drill-down
         el = UIABridge.element_from_point(x, y)
 
-        # If cached tree has a specific smaller leaf control at (x, y) (e.g. Button inside FrameGrabHandle)
+        # If cached tree has a specific leaf control at (x, y), prioritize cached XML tree
         if deepest_node and deepest_node.bounding_rect and deepest_node.bounding_rect.area > 0:
-            if el is None or (el.bounding_rect and deepest_node.bounding_rect.area < el.bounding_rect.area):
+            if el is None or (el.bounding_rect and deepest_node.bounding_rect.area <= el.bounding_rect.area):
                 leaf_el = UIAElement(
                     runtime_id=deepest_node.runtime_id,
                     control_type=deepest_node.tag,

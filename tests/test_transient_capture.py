@@ -52,3 +52,48 @@ def test_uia_list_to_tree_conversion(qapp):
     assert tree_root.children[0].tag == "MenuItem"
     assert tree_root.children[0].automation_id == "item_copy"
     assert tree_root.children[1].automation_id == "item_paste"
+
+
+def test_freeze_snapshot_no_control_emits_failure(qapp, monkeypatch):
+    capturer = TransientCapturer()
+    import uiautomation as auto
+    monkeypatch.setattr(auto, "ControlFromPoint", lambda x, y: None)
+
+    failed_reasons = []
+    capturer.transient_failed.connect(lambda r: failed_reasons.append(r))
+
+    capturer.freeze_snapshot(100, 100)
+    assert len(failed_reasons) == 1
+    assert "No control found" in failed_reasons[0]
+
+
+def test_freeze_snapshot_desktop_emits_failure(qapp, monkeypatch):
+    capturer = TransientCapturer()
+    import uiautomation as auto
+
+    class MockControl:
+        Name = "Desktop"
+        ClassName = "#32769"
+
+    monkeypatch.setattr(auto, "ControlFromPoint", lambda x, y: MockControl())
+
+    failed_reasons = []
+    capturer.transient_failed.connect(lambda r: failed_reasons.append(r))
+
+    capturer.freeze_snapshot(100, 100)
+    assert len(failed_reasons) == 1
+    assert "desktop background" in failed_reasons[0]
+
+
+def test_timed_capture_countdown_and_cancel(qapp):
+    capturer = TransientCapturer()
+    ticks = []
+    capturer.timed_capture_tick.connect(lambda s: ticks.append(s))
+
+    capturer.start_timed_capture(delay_seconds=3)
+    assert ticks == [3]
+    assert capturer._seconds_left == 3
+
+    capturer.cancel_timed_capture()
+    assert capturer._seconds_left == 0
+    assert capturer._countdown_timer is None

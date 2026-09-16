@@ -55,15 +55,29 @@ class ElementBridge:
         if cache and cache.parsed_root:
             root = cache.parsed_root
 
-            # Step 1: RuntimeId match (highest confidence)
+            # Step 1: RuntimeId match with spatial validation (prevents false matches on reused/virtualized IDs)
             if uia_element.runtime_id:
                 node = self._match_by_runtime_id(uia_element.runtime_id, root)
                 if node is not None:
-                    node.bridge_confidence = 1.0
-                    logger.debug("Bridge: Matched by RuntimeId %s (conf: 1.0)", uia_element.runtime_id)
-                    return BridgeResult(node=node, method="runtime_id", confidence=1.0, competing_candidates=0)
+                    is_valid = True
+                    if uia_element.bounding_rect and node.bounding_rect:
+                        if not node.bounding_rect.intersects(uia_element.bounding_rect):
+                            if click_x > 0 and click_y > 0:
+                                is_valid = node.bounding_rect.contains_point(click_x, click_y)
+                            else:
+                                is_valid = False
 
-            # Step 2: Exact BoundingRectangle + ControlType match
+                    if is_valid:
+                        node.bridge_confidence = 1.0
+                        logger.debug("Bridge: Matched by RuntimeId %s (conf: 1.0)", uia_element.runtime_id)
+                        return BridgeResult(node=node, method="runtime_id", confidence=1.0, competing_candidates=0)
+                    else:
+                        logger.warning(
+                            "Bridge: RuntimeId %s matched node '%s' [%s] but bounds %s do not overlap clicked target %s. Rejecting false match.",
+                            uia_element.runtime_id, node.name, node.tag, node.bounding_rect, uia_element.bounding_rect
+                        )
+
+            # Step 2: BoundingRectangle + ControlType match (with DPI/subpixel tolerance)
             if uia_element.bounding_rect:
                 overlapping = self.get_overlapping_nodes(uia_element.bounding_rect, cache)
                 competing_count = max(0, len(overlapping) - 1)
@@ -76,7 +90,7 @@ class ElementBridge:
                 if node is not None:
                     conf = max(0.4, 0.90 - (0.05 * competing_count))
                     node.bridge_confidence = conf
-                    logger.debug("Bridge: Matched by exact BoundingRectangle %s (conf: %.2f)", uia_element.bounding_rect, conf)
+                    logger.debug("Bridge: Matched by BoundingRectangle %s (conf: %.2f)", uia_element.bounding_rect, conf)
                     return BridgeResult(node=node, method="bounding_rect", confidence=conf, competing_candidates=competing_count)
 
             # Step 3: Fuzzy Point-containment hit test (matches deepest leaf at click point)
@@ -89,6 +103,11 @@ class ElementBridge:
 
             if px > 0 and py > 0:
                 node = TreeParser.find_deepest_at_point(root, px, py, tag=uia_element.control_type)
+                if node is None and uia_element.control_type in ("Edit", "Text", "Image", "Custom"):
+                    candidate = TreeParser.find_deepest_at_point(root, px, py, tag="")
+                    if candidate and candidate.tag in TreeParser.INTERACTIVE_TAGS and candidate.tag not in ("Window", "Pane", "AppiumAUT"):
+                        node = candidate
+
                 if node is not None:
                     siblings = len(node.parent.children) if node.parent else 1
                     conf = max(0.4, 0.70 - (0.05 * max(0, siblings - 1)))
@@ -140,6 +159,10 @@ class ElementBridge:
             candidates = TreeParser.find_by_bounding_rect(root, rect, "")
 
         if not candidates:
+            # Try with fuzzy tolerance (within 4 pixels for DPI / border rounding)
+            candidates = self._find_by_fuzzy_rect(root, rect, tag, tolerance=4)
+
+        if not candidates:
             return None
 
         if len(candidates) == 1:
@@ -154,6 +177,22 @@ class ElementBridge:
         # Disambiguate: Smallest area (innermost child)
         candidates.sort(key=lambda n: n.bounding_rect.area if n.bounding_rect else 99999999)
         return candidates[0]
+
+    def _find_by_fuzzy_rect(self, root: UINode, rect: Rect, tag: str = "", tolerance: int = 4) -> List[UINode]:
+        matches: List[UINode] = []
+        queue = deque([root])
+        while queue:
+            node = queue.popleft()
+            if node.bounding_rect:
+                nr = node.bounding_rect
+                if (abs(nr.left - rect.left) <= tolerance and
+                    abs(nr.top - rect.top) <= tolerance and
+                    abs(nr.right - rect.right) <= tolerance and
+                    abs(nr.bottom - rect.bottom) <= tolerance):
+                    if not tag or node.tag == tag:
+                        matches.append(node)
+            queue.extend(node.children)
+        return matches
 
     def _match_by_appium_refind(self, uia_el: UIAElement, session: SessionManager) -> Optional[str]:
         # Construct temporary single-attribute XPath
