@@ -90,16 +90,20 @@ def test_global_key_hook(qapp):
     f3_events = []
     f4_events = []
     esc_events = []
+    ctrl_r_events = []
 
     hook.f3_pressed.connect(lambda: f3_events.append(True))
     hook.f4_pressed.connect(lambda: f4_events.append(True))
     hook.esc_pressed.connect(lambda: esc_events.append(True))
+    hook.ctrl_r_pressed.connect(lambda: ctrl_r_events.append(True))
 
     # Test key event routing
     hook._on_press(keyboard.Key.f3)
     hook._on_press(keyboard.Key.f4)
     hook._on_press(keyboard.Key.esc)
+    hook._on_press(keyboard.KeyCode(char="\x12"))
 
     assert len(f3_events) == 1
     assert len(f4_events) == 1
     assert len(esc_events) == 1
+    assert len(ctrl_r_events) == 1

@@ -5,8 +5,6 @@ Assembles three-panel inspector layout, toolbar, status bar, and coordinates cor
 
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
 import logging
 import os
 import platform
@@ -233,10 +231,11 @@ class MainWindow(QMainWindow):
         self.inspect_mode.hovering.connect(self.status_bar.show_hover_info)
         self.inspect_mode.element_clicked.connect(self._on_element_inspected)
 
-        # Global OS-Level Keyboard Shortcuts (F3, F4, Esc work everywhere)
+        # Global OS-Level Keyboard Shortcuts (F3, F4, Esc, Ctrl+R work everywhere)
         self.key_hook.f3_pressed.connect(self.inspect_mode.toggle)
         self.key_hook.f4_pressed.connect(self._on_f4_freeze_shortcut)
         self.key_hook.esc_pressed.connect(self.inspect_mode.deactivate)
+        self.key_hook.ctrl_r_pressed.connect(self.tree_fetcher.fetch_full)
         if start_hooks:
             self.key_hook.start()
 
@@ -442,38 +441,9 @@ class MainWindow(QMainWindow):
         self._on_node_selected_in_tree(transient_root)
 
     def _on_pin_toggled(self, on: bool) -> None:
-        """Keep xGen floating on top of other windows (seamless zero-blink on Windows; Qt fallback elsewhere)."""
-        if platform.system() == "Windows":
-            try:
-                user32 = ctypes.windll.user32
-                user32.SetWindowPos.argtypes = [
-                    wintypes.HWND,
-                    wintypes.HWND,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    wintypes.UINT,
-                ]
-                user32.SetWindowPos.restype = wintypes.BOOL
-
-                HWND_TOPMOST = wintypes.HWND(ctypes.c_void_p(-1).value)
-                HWND_NOTOPMOST = wintypes.HWND(ctypes.c_void_p(-2).value)
-                SWP_NOMOVE = 0x0002
-                SWP_NOSIZE = 0x0001
-                SWP_NOACTIVATE = 0x0010
-                SWP_SHOWWINDOW = 0x0040
-                flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
-
-                hwnd = wintypes.HWND(int(self.winId()))
-                target_insert = HWND_TOPMOST if on else HWND_NOTOPMOST
-                user32.SetWindowPos(hwnd, target_insert, 0, 0, 0, 0, flags)
-            except Exception as e:
-                logger.warning("SetWindowPos pin failed: %s", e)
-        else:
-            # macOS / Linux: Qt-native always-on-top
-            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
-            self.show()
+        """Keep xGen floating on top of other windows (cross-platform via Qt)."""
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        self.show()
 
     def changeEvent(self, event: object) -> None:
         """Auto-deactivate inspect mode when xGen is minimized."""

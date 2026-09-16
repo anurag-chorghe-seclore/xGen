@@ -136,6 +136,10 @@ class TreeFetcher(QObject):
         """
         Initiate asynchronous Tier 3 full tree fetch for the given window handle.
         """
+        if self._is_fetching:
+            logger.debug("Tree fetch already in progress, ignoring duplicate request.")
+            return
+
         handle = window_handle
         if not handle:
             info = self.session_manager.session_info
