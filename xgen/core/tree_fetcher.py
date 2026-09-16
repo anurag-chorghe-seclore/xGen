@@ -48,6 +48,7 @@ class TreeFetchWorker(QObject):
             # 1. Fetch raw XML from active Appium session
             raw_xml = self.session_manager.get_source(timeout_seconds=self.config.source_fetch_timeout_seconds)
             if self._is_cancelled:
+                self.failed.emit("Tree fetch cancelled.")
                 return
 
             # 2. Report progress
@@ -62,6 +63,7 @@ class TreeFetchWorker(QObject):
             # 4. Parse into UINode in-memory hierarchy
             parsed_root = TreeParser.parse(raw_xml)
             if self._is_cancelled:
+                self.failed.emit("Tree fetch cancelled.")
                 return
 
             # 5. Compile live lxml ElementTree with direct UINode mapping for XPath querying
@@ -82,6 +84,7 @@ class TreeFetchWorker(QObject):
         except Exception as e:
             if self._is_cancelled or not self.session_manager.session_id or "invalid session" in str(e).lower() or "terminated" in str(e).lower():
                 logger.info("Tree fetch cancelled (session disconnected or terminated).")
+                self.failed.emit("Tree fetch cancelled.")
             else:
                 logger.error("Full tree fetch failed: %s", e)
                 self.failed.emit(str(e))
@@ -132,20 +135,21 @@ class TreeFetcher(QObject):
         self._thread.quit()
         self._thread.wait(2000)
 
-    def fetch_full(self, window_handle: str = "") -> None:
+    def fetch_full(self, window_handle: str = "", force: bool = False) -> None:
         """
         Initiate asynchronous Tier 3 full tree fetch for the given window handle.
         """
-        if self._is_fetching:
+        if self._is_fetching and not force:
             logger.debug("Tree fetch already in progress, ignoring duplicate request.")
             return
 
         handle = window_handle
         if not handle:
             info = self.session_manager.session_info
-            handle = info.active_handle if info else "Root"
+            handle = info.active_handle if (info and info.active_handle) else "Root"
 
         self._is_fetching = True
+        logger.info("Initiating full UI tree fetch for handle '%s'...", handle)
         self._req_fetch_full.emit(handle, FetchTier.FULL.value)
 
     def cancel(self) -> None:

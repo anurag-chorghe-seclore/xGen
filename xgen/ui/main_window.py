@@ -341,8 +341,8 @@ class MainWindow(QMainWindow):
 
     def _on_session_started(self, info) -> None:
         self.status_bar.lbl_msg.setText(f"Connected to {info.app_name}. Fetching initial UI tree...")
-        # Auto-fetch tree on session connect
-        self.tree_fetcher.fetch_full(info.active_handle)
+        # Auto-fetch tree on session connect (force new fetch)
+        self.tree_fetcher.fetch_full(info.active_handle, force=True)
 
     def _on_session_error(self, err: str) -> None:
         title, friendly_msg, tech_details = format_session_error(err)
