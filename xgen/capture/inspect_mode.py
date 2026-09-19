@@ -16,7 +16,8 @@ from xgen.capture.overlay_window import OverlayWindow
 from xgen.config import XGenConfig
 from xgen.core.tree_cache import TreeCacheStore
 from xgen.core.tree_parser import TreeParser
-from xgen.core.uia_bridge import UIABridge, UIAElement
+from xgen.platform.backend import NativeElement as UIAElement
+from xgen.platform.factory import get_platform_backend
 from xgen.utils.dpi import get_physical_cursor_pos
 
 logger = logging.getLogger("xgen.inspect")
@@ -128,8 +129,8 @@ class InspectMode(QObject):
         if cache and cache.parsed_root:
             deepest_node = TreeParser.find_deepest_at_point(cache.parsed_root, x, y)
 
-        # 2. Query live UIA element with child drill-down
-        el = UIABridge.element_from_point(x, y)
+        # 2. Query live native element with child drill-down
+        el = get_platform_backend().element_from_point(x, y)
 
         # If cached tree has a specific leaf control at (x, y), prioritize cached XML tree
         if deepest_node and deepest_node.bounding_rect and deepest_node.bounding_rect.area > 0:
@@ -160,7 +161,7 @@ class InspectMode(QObject):
 
         target_el = self._last_uia_el
         if target_el is None:
-            target_el = UIABridge.element_from_point(x, y)
+            target_el = get_platform_backend().element_from_point(x, y)
 
         logger.info("Element clicked at (%d, %d): %s [%s]", x, y, target_el.control_type if target_el else "None", target_el.automation_id if target_el else "")
 

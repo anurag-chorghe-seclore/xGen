@@ -1,8 +1,8 @@
 ﻿PyQt6>=6.6.0
 requests>=2.31.0
 lxml>=5.1.0
-uiautomation>=2.0.18
+uiautomation>=2.0.18; sys_platform == "win32"
 pynput>=1.7.6
-pywin32>=306
+pywin32>=306; sys_platform == "win32"
 pytest>=8.0.0
 responses>=0.25.0

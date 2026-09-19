@@ -1,0 +1,147 @@
+"""
+PlatformBackend — the single interface every native-OS operation in xGen goes through.
+
+One composite interface (not many small ones) by design: fewer files to maintain,
+one obvious place to look for "what does xGen ask the OS to do." See
+`xgen.platform.factory.get_platform_backend()` for how an implementation is chosen,
+`xgen.platform.windows_backend.WindowsBackend` for the (only) real implementation,
+and `xgen.platform.unsupported_backend.UnsupportedBackend` for the safe no-op used
+on any non-Windows `sys.platform`.
+"""
+
+from __future__ import annotations
+
+import datetime
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List, Optional, Protocol, Tuple
+
+from xgen.utils.rect import Rect
+
+if TYPE_CHECKING:
+    # Avoids a runtime import cycle: xgen.utils.window_finder imports this
+    # module's factory, so it must not need this module fully loaded back.
+    from xgen.utils.window_finder import WindowTarget
+
+
+@dataclass
+class NativeElement:
+    """
+    Thread-safe, detached snapshot of a single native UI element, as reported
+    by whatever accessibility API the current platform backend uses (UI
+    Automation on Windows today).
+
+    This is the same shape xGen has always called `UIAElement` — that name is
+    kept as an alias in `xgen.core.uia_bridge` for backward compatibility.
+    """
+    runtime_id: str                      # e.g. "42.12345.0"
+    control_type: str                    # "Button", "Edit", etc.
+    name: str = ""
+    automation_id: str = ""
+    class_name: str = ""
+    bounding_rect: Optional[Rect] = None
+    is_enabled: bool = True
+    native_handle: int = 0               # HWND (or platform equivalent) or 0
+    help_text: str = ""
+    aria_properties: str = ""
+
+
+@dataclass
+class TransientSnapshotResult:
+    """Result of an F4 "capture the ephemeral element under the cursor" attempt."""
+    status: str                          # "ok" | "no_control" | "desktop" | "unavailable" | "error"
+    elements: List[NativeElement] = field(default_factory=list)
+    message: str = ""
+
+
+class PlatformBackend(Protocol):
+    """
+    Every native-OS operation xGen needs, grouped by concern but defined on one
+    interface. A method's docstring here is normative: an implementation must
+    match this behavior (including on failure) for callers not to need to know
+    which backend they're talking to.
+    """
+
+    # --- Accessibility (native UIA / AX-equivalent) ---
+
+    def initialize_accessibility(self) -> None:
+        """One-time setup (e.g. COM init on Windows). Safe to call multiple times."""
+        ...
+
+    def is_accessibility_available(self) -> bool:
+        """True if native element-under-cursor / subtree-walk queries can run at all."""
+        ...
+
+    def element_from_point(self, x: int, y: int) -> Optional[NativeElement]:
+        """Fast in-process "what's the topmost interactive control at (x, y)". None if unavailable or nothing found."""
+        ...
+
+    def walk_subtree(
+        self,
+        root_element: Optional[NativeElement] = None,
+        max_depth: int = 20,
+        max_elements: int = 250,
+    ) -> List[NativeElement]:
+        """BFS walk of the native subtree rooted at root_element's window handle. Empty list if unavailable."""
+        ...
+
+    def capture_transient_snapshot(self, cursor_x: int, cursor_y: int) -> TransientSnapshotResult:
+        """F4: find and walk the topmost ephemeral container (menu/tooltip/popup) under the cursor."""
+        ...
+
+    # --- Window enumeration / hit-testing ---
+
+    def get_open_windows(self) -> List["WindowTarget"]:
+        """Visible top-level application windows, Desktop Root first. [Desktop Root] only if unavailable."""
+        ...
+
+    def window_from_point(self, x: int, y: int) -> Optional[int]:
+        """Native window handle at (x, y), or None."""
+        ...
+
+    def get_process_id_for_window(self, hwnd: int) -> Optional[int]:
+        """Owning process id for a window handle, or None."""
+        ...
+
+    # --- Overlay window native styling ---
+
+    def apply_click_through(self, widget: object) -> None:
+        """Make a Qt widget click-through at the native window-manager level, if supported."""
+        ...
+
+    def enforce_topmost(self, widget: object) -> None:
+        """Raise a Qt widget above other top-level windows (including menus), if supported."""
+        ...
+
+    # --- Display / DPI ---
+
+    def init_dpi_awareness(self) -> None:
+        """Opt the process into per-monitor DPI awareness before any UI is created. No-op if not applicable."""
+        ...
+
+    def get_physical_cursor_pos(self) -> Tuple[int, int]:
+        """Current mouse cursor position in physical (not DPI-scaled) screen pixels."""
+        ...
+
+    def get_dpi_for_window(self, hwnd: int) -> int:
+        """DPI for the given window handle. 96 (the OS-agnostic default) if unavailable."""
+        ...
+
+    # --- Privilege ---
+
+    def is_running_as_admin(self) -> bool:
+        """True if the current process has elevated/administrator privileges."""
+        ...
+
+    def relaunch_as_admin(self) -> bool:
+        """Relaunch the current process elevated. True if the relaunch was initiated (process should exit after)."""
+        ...
+
+    # --- Cursor / app identity ---
+
+    def move_cursor_to(self, x: int, y: int) -> bool:
+        """Last-resort physical cursor move (used when a driver-side hover action isn't available)."""
+        ...
+
+    def set_app_user_model_id(self, app_id: str) -> None:
+        """Set the OS-level app identity used for taskbar grouping/icon, if applicable. No-op if not."""
+        ...

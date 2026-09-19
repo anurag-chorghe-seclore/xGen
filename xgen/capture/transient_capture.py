@@ -7,25 +7,14 @@ from __future__ import annotations
 
 import datetime
 import logging
-from collections import deque
 from typing import List, Optional, Set
-from PyQt6.QtCore import QObject, QThreadPool, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QCursor
-
-try:
-    import win32api
-    HAS_PYWIN32 = True
-except ImportError:
-    win32api = None        # type: ignore
-    HAS_PYWIN32 = False
-
-import uiautomation as auto
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from xgen.core.tree_cache import TreeCacheStore
-from xgen.core.tree_parser import TreeParser, UINode
-from xgen.core.uia_bridge import UIABridge, UIAElement
+from xgen.core.tree_parser import UINode
+from xgen.platform.backend import NativeElement as UIAElement
+from xgen.platform.factory import get_platform_backend
 from xgen.utils.dpi import get_physical_cursor_pos
-from xgen.utils.rect import Rect
 
 logger = logging.getLogger("xgen.transient")
 
@@ -75,58 +64,33 @@ class TransientCapturer(QObject):
         Executed without stealing window focus.
         """
         logger.info("F4 Freeze Snapshot triggered at (%d, %d)", cursor_x, cursor_y)
-        try:
-            ctrl = auto.ControlFromPoint(cursor_x, cursor_y)
-            if ctrl is None:
-                logger.warning("F4: No control found under cursor.")
-                self.transient_failed.emit("No control found under cursor.")
-                return
+        result = get_platform_backend().capture_transient_snapshot(cursor_x, cursor_y)
 
-            if getattr(ctrl, "Name", "") == "Desktop" or getattr(ctrl, "ClassName", "") == "#32769":
-                logger.info("F4: Cursor is over desktop background.")
-                self.transient_failed.emit("Cursor is over desktop background. Hover over an application element.")
-                return
+        if result.status == "no_control":
+            logger.warning("F4: %s", result.message)
+            self.transient_failed.emit(result.message)
+            return
+        if result.status == "desktop":
+            logger.info("F4: Cursor is over desktop background.")
+            self.transient_failed.emit(result.message)
+            return
+        if result.status == "unavailable":
+            logger.info("F4: %s", result.message)
+            self.transient_failed.emit(result.message)
+            return
+        if result.status == "error":
+            logger.error("F4 Freeze Snapshot error: %s", result.message)
+            self.transient_failed.emit(result.message)
+            return
 
-            SPECIFIC_TRANSIENT = {"Menu", "ToolTip", "Popup", "Flyout", "MenuItem"}
-
-            # Walk up to the topmost transient container (popup window or menu)
-            top_transient = ctrl
-            curr = ctrl
-            while curr:
-                ct = curr.ControlTypeName.replace("Control", "")
-                if ct in SPECIFIC_TRANSIENT:
-                    top_transient = curr
-                parent = curr.GetParentControl()
-                if not parent or getattr(parent, "Name", "") == "Desktop":
-                    class_name = getattr(curr, "ClassName", "")
-                    if class_name in ("#32768", "tooltips_class32") or "Popup" in class_name or "DropDown" in class_name:
-                        top_transient = curr
-                    break
-                parent_ct = parent.ControlTypeName.replace("Control", "")
-                if parent_ct == "Window" and ct not in SPECIFIC_TRANSIENT:
-                    break
-                curr = parent
-
-            # Walk entire transient subtree
-            elements = UIABridge.walk_subtree(root_ctrl=top_transient)
-            if not elements:
-                # Fallback to single element snapshot
-                single_el = UIABridge._control_to_element(top_transient)
-                if single_el:
-                    elements = [single_el]
-
-            if elements:
-                # Convert to hierarchical UINode tree
-                transient_root = self._uia_list_to_tree(elements)
-                # Merge into active window cache
-                TreeCacheStore.instance().merge_transient(active_handle, transient_root)
-                self.transient_captured.emit(transient_root)
-                logger.info("F4: Successfully captured %d transient elements.", len(elements))
-            else:
-                self.transient_failed.emit("No UI elements found under cursor.")
-        except Exception as e:
-            logger.exception("F4 Freeze Snapshot error: %s", e)
-            self.transient_failed.emit(f"Capture failed: {e}")
+        elements = result.elements
+        if elements:
+            transient_root = self._uia_list_to_tree(elements)
+            TreeCacheStore.instance().merge_transient(active_handle, transient_root)
+            self.transient_captured.emit(transient_root)
+            logger.info("F4: Successfully captured %d transient elements.", len(elements))
+        else:
+            self.transient_failed.emit("No UI elements found under cursor.")
 
     # --- Mechanism 2: Timed Countdown Capture ---
 
@@ -161,12 +125,12 @@ class TransientCapturer(QObject):
     # --- Mechanism 3: Automatic Structure Changed Hook ---
 
     def on_structure_changed(self, uia_el: UIAElement, change_type: str) -> None:
-        """Triggered automatically when UI Automation fires ChildAdded event."""
+        """Triggered automatically when the native accessibility API fires a ChildAdded event."""
         if change_type != "ChildAdded" or uia_el.control_type not in self.TRANSIENT_TYPES:
             return
 
         logger.info("Auto-Structure Hook: Detected new %s", uia_el.control_type)
-        elements = UIABridge.walk_subtree(root_element=uia_el)
+        elements = get_platform_backend().walk_subtree(root_element=uia_el)
         if elements:
             transient_root = self._uia_list_to_tree(elements)
             TreeCacheStore.instance().merge_transient("", transient_root)

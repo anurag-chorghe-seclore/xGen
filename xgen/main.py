@@ -13,6 +13,7 @@ from xgen.utils.dpi import init_dpi_awareness
 init_dpi_awareness()
 
 from xgen.config import ConfigManager
+from xgen.platform.factory import get_platform_backend
 from xgen.ui.crash_dialog import install_global_excepthook
 from xgen.ui.main_window import MainWindow
 from xgen.ui.theme import apply_dark_theme
@@ -22,10 +23,9 @@ from xgen.utils.logger import setup_logging
 log_file = setup_logging(logging.INFO)
 install_global_excepthook()
 
-# Set Windows explicit AppUserModelID so taskbar displays the custom icon
+# Set explicit AppUserModelID so the taskbar displays the custom icon. No-op where not applicable.
 try:
-    import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("xgen.xpath.inspector.v1")
+    get_platform_backend().set_app_user_model_id("xgen.xpath.inspector.v1")
 except Exception:
     pass
 

@@ -9,7 +9,6 @@ import datetime
 import logging
 import os
 from pathlib import Path
-import platform
 import sys
 from typing import Optional
 from PyQt6.QtCore import Qt, QPoint, QTimer, QEvent, QObject, pyqtSignal
@@ -28,17 +27,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-try:
-    import win32api
-    import win32gui
-    import win32process
-    HAS_PYWIN32 = True
-except ImportError:
-    win32api = None        # type: ignore
-    win32gui = None        # type: ignore
-    win32process = None    # type: ignore
-    HAS_PYWIN32 = False
-
 from xgen.capture.inspect_mode import InspectMode
 from xgen.capture.keyboard_hook import GlobalKeyHook
 from xgen.capture.mouse_hook import MouseHook
@@ -53,6 +41,7 @@ from xgen.core.tree_fetcher import TreeFetcher
 from xgen.core.tree_parser import TreeParser, UINode
 from xgen.core.uia_bridge import UIAElement
 from xgen.events.event_bus import EventBus
+from xgen.platform.factory import get_platform_backend
 from xgen.ui.attribute_panel import AttributePanel
 from xgen.ui.disambiguation_popup import DisambiguationPopup
 from xgen.ui.legend_dialog import LegendDialog
@@ -1085,16 +1074,16 @@ class MainWindow(QMainWindow):
         Returns True if screen coordinate is outside xGen's own window geometry
         AND not on the Windows Taskbar / System Tray.
         """
-        # 1. Native Win32 Process check: if HWND under cursor belongs to our own PID, NEVER suppress!
-        if HAS_PYWIN32 and win32gui and win32process:
-            try:
-                hwnd = win32gui.WindowFromPoint((screen_x, screen_y))
-                if hwnd:
-                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    if pid == os.getpid():
-                        return False
-            except Exception:
-                pass
+        # 1. Native process check: if the window under cursor belongs to our own PID, NEVER suppress!
+        backend = get_platform_backend()
+        try:
+            hwnd = backend.window_from_point(screen_x, screen_y)
+            if hwnd:
+                pid = backend.get_process_id_for_window(hwnd)
+                if pid == os.getpid():
+                    return False
+        except Exception:
+            pass
 
         # 2. Check if click is inside xGen's own window geometry
         dpr = get_screen_dpr_at(screen_x, screen_y)

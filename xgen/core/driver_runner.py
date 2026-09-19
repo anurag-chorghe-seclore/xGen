@@ -13,14 +13,8 @@ from typing import Optional
 import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
-try:
-    import win32api
-    HAS_PYWIN32 = True
-except ImportError:
-    win32api = None        # type: ignore
-    HAS_PYWIN32 = False
-
 from xgen.core.session_manager import SessionManager
+from xgen.platform.factory import get_platform_backend
 from xgen.utils.rect import Rect
 
 logger = logging.getLogger("xgen.runner")
@@ -234,13 +228,13 @@ class DriverRunner(QObject):
                 pass
 
             # 3. Fallback to physical cursor move via test_res.bounding_rect
-            if test_res.bounding_rect and HAS_PYWIN32 and win32api:
+            if test_res.bounding_rect:
                 try:
                     cx = test_res.bounding_rect.center_x
                     cy = test_res.bounding_rect.center_y
-                    win32api.SetCursorPos((cx, cy))
-                    self.action_completed.emit("Hover", True, f"Moved mouse to ({cx}, {cy})")
-                    return True
+                    if get_platform_backend().move_cursor_to(cx, cy):
+                        self.action_completed.emit("Hover", True, f"Moved mouse to ({cx}, {cy})")
+                        return True
                 except Exception as e:
                     self.action_completed.emit("Hover", False, str(e))
                     return False
