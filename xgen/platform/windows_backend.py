@@ -364,6 +364,39 @@ class WindowsBackend:
             kernel32.CloseHandle(h_proc)
         return ""
 
+    # WM_GETTEXT plus SendMessageTimeoutW's ABORTIFHUNG flag, used by
+    # _get_window_title_safe() below to bound the wait on one stuck window
+    # (see Issue 1 / Refresh-button ANR for why this exists).
+    _WM_GETTEXT = 0x000D
+    _SMTO_ABORTIFHUNG = 0x0002
+    _SMTO_BLOCK = 0x0001
+    _WINDOW_TITLE_TIMEOUT_MS = 200
+
+    @classmethod
+    def _get_window_title_safe(cls, hwnd: int) -> Optional[str]:
+        """Read a window's title without risking an unbounded block.
+
+        GetWindowTextW()/GetWindowTextLengthW() send a cross-process WM_GETTEXT
+        message and block with NO timeout if the target window's own message loop
+        is busy or stuck — that unbounded wait, hit during EnumWindows on the UI
+        thread, is exactly what caused the Refresh-button ANR (Issue 1). Calling
+        SendMessageTimeoutW directly with SMTO_ABORTIFHUNG bounds the wait so one
+        unresponsive window can never hang enumeration; a window that doesn't
+        reply in time is treated as if it has no title (same as today's
+        "if length == 0: skip" case for genuinely untitled windows).
+        """
+        user32 = ctypes.windll.user32
+        buf = ctypes.create_unicode_buffer(512)
+        result = ctypes.wintypes.DWORD(0)
+        replied = user32.SendMessageTimeoutW(
+            hwnd, cls._WM_GETTEXT, 512, buf,
+            cls._SMTO_ABORTIFHUNG | cls._SMTO_BLOCK, cls._WINDOW_TITLE_TIMEOUT_MS,
+            ctypes.byref(result),
+        )
+        if not replied:
+            return None
+        return buf.value.strip()
+
     def _enumerate_windows_win32(self) -> List[WindowTarget]:
         """Walk all top-level windows via EnumWindows, keeping only visible app windows."""
         user32 = ctypes.windll.user32
@@ -380,12 +413,7 @@ class WindowsBackend:
             if not user32.IsWindowVisible(hwnd):
                 return True
 
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = buf.value.strip()
+            title = self._get_window_title_safe(hwnd)
             if not title:
                 return True
 

@@ -56,6 +56,19 @@ from xgen.utils.dpi import get_physical_cursor_pos, get_screen_dpr_at
 logger = logging.getLogger("xgen.ui.main")
 
 
+class _WindowEnumBridge(QObject):
+    """Marshals a background window-enumeration scan back onto the Qt GUI thread.
+
+    get_open_windows() walks every top-level window via EnumWindows and calls
+    GetWindowTextW/GetWindowTextLengthW on each one; those send a cross-process
+    WM_GETTEXT and block with no timeout if the target window's own message loop
+    is stuck. Running that on the UI thread is what causes the Refresh-button ANR
+    (Issue 1) — this bridge lets the scan run on a plain background thread while
+    still landing its result back on the GUI thread via a queued signal.
+    """
+    finished = pyqtSignal(list, object)  # windows, selected_handle (Optional[str])
+
+
 class MainWindow(QMainWindow):
     """
     Primary workspace window orchestrating the 3-panel layout, session lifecycle,
@@ -113,6 +126,11 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
 
         self.disambiguation_popup = DisambiguationPopup(self)
+
+        # Window-picker enumeration bridge (see Issue 1 / Refresh-button ANR):
+        # get_open_windows() runs on a background thread; results land here.
+        self._window_enum_bridge = _WindowEnumBridge(self)
+        self._window_enum_bridge.finished.connect(self._on_windows_enumerated)
 
         self._init_layout()
         self._wire_signals(start_hooks=start_hooks)
@@ -262,7 +280,16 @@ class MainWindow(QMainWindow):
 
     def _on_session_dialog_requested(self, cfg: XGenConfig) -> None:
         self._refresh_window_picker(selected_handle=cfg.app_top_level_window)
-        self.session_manager.connect(cfg)
+        if self.session_manager.is_connected:
+            # connect() no-ops while already CONNECTED (see SessionManager.connect),
+            # so switching targets from an already-connected Session Dialog must go
+            # through reconnect() (disconnect + connect) instead — same pattern the
+            # toolbar's window switcher already uses in _on_window_switched().
+            logger.info("Session Dialog: already connected, reconnecting to switch target.")
+            self.tree_fetcher.cancel()
+            self.session_manager.reconnect(cfg)
+        else:
+            self.session_manager.connect(cfg)
 
     def _open_legend_dialog(self) -> None:
         """Open the interactive XPath Selector Quality Guide and Index Dialog."""
@@ -425,20 +452,37 @@ class MainWindow(QMainWindow):
         self._refresh_window_picker()
 
     def _refresh_window_picker(self, selected_handle: Optional[str] = None) -> None:
-        """Scan open windows on OS and update toolbar window selector."""
-        try:
-            from xgen.utils.window_finder import get_open_windows
-            windows = get_open_windows()
+        """Scan open windows on OS and update toolbar window selector.
 
-            if not selected_handle:
-                if self.session_manager.is_connected and self.session_manager.session_info and self.session_manager.session_info.active_handle:
-                    selected_handle = self.session_manager.session_info.active_handle
-                elif self.config.app_top_level_window:
-                    selected_handle = self.config.app_top_level_window
+        The scan itself (get_open_windows() -> EnumWindows + GetWindowTextW) runs on a
+        background thread, never on the UI thread — see Issue 1 (Refresh-button ANR) in
+        the platform-abstraction plan doc for why a synchronous call here can freeze xGen.
+        """
+        import threading
 
-            self.toolbar.update_windows_list(windows, selected_handle=selected_handle)
-        except Exception as e:
-            logger.warning("Could not refresh window picker: %s", e)
+        def _scan() -> None:
+            try:
+                from xgen.utils.window_finder import get_open_windows
+                windows = get_open_windows()
+            except Exception as e:
+                logger.warning("Could not refresh window picker: %s", e)
+                windows = []
+            try:
+                self._window_enum_bridge.finished.emit(windows, selected_handle)
+            except RuntimeError:
+                pass  # MainWindow (and its bridge) was already destroyed.
+
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _on_windows_enumerated(self, windows: list, selected_handle: Optional[str]) -> None:
+        """Apply a background window-enumeration result to the toolbar's window selector."""
+        if not selected_handle:
+            if self.session_manager.is_connected and self.session_manager.session_info and self.session_manager.session_info.active_handle:
+                selected_handle = self.session_manager.session_info.active_handle
+            elif self.config.app_top_level_window:
+                selected_handle = self.config.app_top_level_window
+
+        self.toolbar.update_windows_list(windows, selected_handle=selected_handle)
 
     def _on_session_state_changed(self, state_str: str) -> None:
         app_name = self.session_manager.session_info.app_name if self.session_manager.session_info else ""
@@ -1075,13 +1119,26 @@ class MainWindow(QMainWindow):
         AND not on the Windows Taskbar / System Tray.
         """
         # 1. Native process check: if the window under cursor belongs to our own PID, NEVER suppress!
+        #
+        # Exception: our own highlight overlay is deliberately click-through
+        # (WS_EX_TRANSPARENT) so real mouse input passes through it to whatever's
+        # underneath — but WindowFromPoint is a pure Z-order hit-test that does NOT
+        # honor that flag, so it can still report the overlay's own HWND at the point
+        # where a background element was last highlighted. Left unguarded, that makes
+        # this own-PID check misfire and wrongly suppress hover resolution for the real
+        # background app underneath the overlay (see Issue 2 / Pin-related hover glitch).
         backend = get_platform_backend()
         try:
             hwnd = backend.window_from_point(screen_x, screen_y)
             if hwnd:
-                pid = backend.get_process_id_for_window(hwnd)
-                if pid == os.getpid():
-                    return False
+                try:
+                    overlay_hwnd = int(self.overlay.winId())
+                except Exception:
+                    overlay_hwnd = None
+                if hwnd != overlay_hwnd:
+                    pid = backend.get_process_id_for_window(hwnd)
+                    if pid == os.getpid():
+                        return False
         except Exception:
             pass
 

@@ -71,6 +71,22 @@ def test_toolbar_refresh_button_states(qapp):
     assert toolbar.btn_refresh.isEnabled() is True
 
 
+def test_toolbar_pin_button_label_reflects_checked_state(qapp):
+    """Issue 3 regression: label must flip to 'Pinned' while checked, not just the style."""
+    toolbar = Toolbar()
+    assert toolbar.btn_pin.text() == "📌 Pin"
+
+    emitted = []
+    toolbar.pin_toggled.connect(lambda on: emitted.append(on))
+
+    toolbar.btn_pin.setChecked(True)
+    assert toolbar.btn_pin.text() == "📌 Pinned"
+    assert emitted == [True]
+
+    toolbar.btn_pin.setChecked(False)
+    assert toolbar.btn_pin.text() == "📌 Pin"
+    assert emitted == [True, False]
+
 
 def test_toolbar_update_windows_list_handle_normalization(qapp):
     from xgen.utils.window_finder import WindowTarget
@@ -167,6 +183,8 @@ def test_xpath_panel_generation_and_prefix_toggle(qapp):
 
 
 def test_main_window_assembly(qapp):
+    import time
+
     cfg = XGenConfig(auto_connect_on_startup=False)
     win = MainWindow(cfg, start_hooks=False)
     assert win.tree_panel is not None
@@ -174,6 +192,15 @@ def test_main_window_assembly(qapp):
     assert win.xpath_panel is not None
     assert win.toolbar is not None
     assert win.status_bar is not None
+
+    # The initial window-picker scan runs on a background thread (see Issue 1 /
+    # Refresh-button ANR) and lands on the toolbar asynchronously, so give it a
+    # moment to arrive rather than asserting on it synchronously.
+    deadline = time.time() + 2.0
+    while win.toolbar.combo_windows.count() < 1 and time.time() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+
     assert win.toolbar.combo_windows.count() >= 1
     assert "Desktop Root" in win.toolbar.combo_windows.itemText(0)
 
@@ -432,6 +459,140 @@ def test_main_window_window_switch_cancel_and_allow(qapp, monkeypatch):
         win._on_window_switched("")
         assert reconnect_mock.call_count == 1
         assert win.config.app_top_level_window == ""
+    finally:
+        win.session_manager.close()
+        win.tree_fetcher.close()
+        win.close()
+
+
+def test_session_dialog_switch_target_while_connected_reconnects(qapp, monkeypatch):
+    """Issue 4 regression: SessionManager.connect() silently no-ops while already
+    CONNECTED, so switching targets from the Session Dialog must go through
+    reconnect() instead — mirroring the toolbar window-switcher's existing pattern
+    in _on_window_switched(). Confirmed to affect Desktop Root, Window Handle, and
+    Launch Exe dialog modes alike, since all three funnel through the same
+    session_requested signal / _on_session_dialog_requested handler."""
+    from unittest.mock import MagicMock
+    from xgen.core.session_manager import SessionInfo, SessionState
+
+    cfg = XGenConfig(auto_connect_on_startup=False)
+    win = MainWindow(cfg, start_hooks=False)
+    try:
+        connect_mock = MagicMock()
+        reconnect_mock = MagicMock()
+        monkeypatch.setattr(win.session_manager, "connect", connect_mock)
+        monkeypatch.setattr(win.session_manager, "reconnect", reconnect_mock)
+
+        # 1. Not connected yet: dialog's target should go through connect(), not reconnect().
+        first_cfg = XGenConfig(app_top_level_window="0x1111")
+        win._on_session_dialog_requested(first_cfg)
+        assert connect_mock.call_count == 1
+        assert connect_mock.call_args[0][0] is first_cfg
+        assert reconnect_mock.call_count == 0
+
+        # 2. Already connected (e.g. Launch Exe or Window Handle mode picked while a
+        # session is live): switching targets must reconnect(), never silently no-op.
+        win.session_manager.state = SessionState.CONNECTED
+        win.session_manager._session_id = "sid-already-connected"
+        win.session_manager.session_info = SessionInfo(
+            session_id="sid-already-connected",
+            appium_url="http://127.0.0.1:4723",
+            app_name="App 1",
+            windows=[],
+            active_handle="0x1111"
+        )
+
+        second_cfg = XGenConfig(app_top_level_window="0x2222")
+        win._on_session_dialog_requested(second_cfg)
+        assert connect_mock.call_count == 1, "connect() must not be called again while already connected"
+        assert reconnect_mock.call_count == 1
+        assert reconnect_mock.call_args[0][0] is second_cfg
+    finally:
+        win.session_manager.close()
+        win.tree_fetcher.close()
+        win.close()
+
+
+def test_is_point_outside_xgen_ignores_own_overlay_hwnd(qapp, monkeypatch):
+    """Issue 2 regression: WindowFromPoint is a pure Z-order hit-test that does NOT
+    honor the highlight overlay's WS_EX_TRANSPARENT click-through styling, so it can
+    report the overlay's own HWND at a point where a background element was last
+    highlighted. That must not be treated as 'point is inside xGen' (which would
+    wrongly suppress hover resolution for the real app underneath) -- but a point
+    genuinely over some other xGen-owned window must still be suppressed."""
+    import os
+    from PyQt6.QtCore import QRect
+
+    cfg = XGenConfig(auto_connect_on_startup=False)
+    win = MainWindow(cfg, start_hooks=False)
+    try:
+        overlay_hwnd = int(win.overlay.winId())
+        own_pid = os.getpid()
+
+        class _FakeBackend:
+            def __init__(self, hwnd):
+                self._hwnd = hwnd
+
+            def window_from_point(self, x, y):
+                return self._hwnd
+
+            def get_process_id_for_window(self, hwnd):
+                return own_pid
+
+        # Isolate step 1 (the PID/HWND short-circuit under test) from the later
+        # geometry/taskbar checks: force "not inside xGen's own frame" and skip the
+        # taskbar branch entirely, regardless of the sandbox's actual screen size.
+        monkeypatch.setattr(win, "frameGeometry", lambda: QRect(-5000, -5000, 1, 1))
+        monkeypatch.setattr(QApplication, "instance", staticmethod(lambda: None))
+
+        # Case 1: WindowFromPoint reports our own overlay's HWND -- must NOT be
+        # treated as "inside xGen" (the overlay is deliberately click-through).
+        monkeypatch.setattr("xgen.ui.main_window.get_platform_backend", lambda: _FakeBackend(overlay_hwnd))
+        assert win._is_point_outside_xgen(100, 100) is True
+
+        # Case 2: WindowFromPoint reports some other window genuinely owned by our
+        # own PID (e.g. the main window itself) -- must still be suppressed.
+        monkeypatch.setattr("xgen.ui.main_window.get_platform_backend", lambda: _FakeBackend(overlay_hwnd + 1))
+        assert win._is_point_outside_xgen(100, 100) is False
+    finally:
+        win.session_manager.close()
+        win.tree_fetcher.close()
+        win.close()
+
+
+def test_refresh_window_picker_runs_off_ui_thread(qapp, monkeypatch):
+    """Issue 1 regression: get_open_windows() must never run synchronously on the UI
+    thread — EnumWindows + GetWindowTextW can block indefinitely if any top-level
+    window's message loop is stuck. Confirms _refresh_window_picker() dispatches to a
+    background thread and the result still lands on the toolbar via the Qt bridge."""
+    import threading
+    import time
+
+    calling_threads = []
+
+    def fake_get_open_windows():
+        calling_threads.append(threading.current_thread())
+        return []
+
+    monkeypatch.setattr("xgen.utils.window_finder.get_open_windows", fake_get_open_windows)
+
+    cfg = XGenConfig(auto_connect_on_startup=False)
+    win = MainWindow(cfg, start_hooks=False)
+    try:
+        calling_threads.clear()
+        win._refresh_window_picker(selected_handle="0xabc")
+
+        # The scan is asynchronous: give the background thread a moment to run and
+        # pump the Qt event loop so the queued 'finished' signal can be delivered.
+        deadline = time.time() + 2.0
+        while not calling_threads and time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.01)
+
+        assert calling_threads, "get_open_windows() was never invoked"
+        assert calling_threads[0] is not threading.main_thread(), (
+            "get_open_windows() must run on a background thread, not the UI thread"
+        )
     finally:
         win.session_manager.close()
         win.tree_fetcher.close()

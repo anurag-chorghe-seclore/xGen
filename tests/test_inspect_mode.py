@@ -20,7 +20,18 @@ def qapp():
     return app
 
 
-def test_overlay_window_geometry(qapp):
+def test_overlay_window_geometry(qapp, monkeypatch):
+    # move_to() converts the (physical-pixel) target rect to Qt logical coordinates
+    # via physical_to_logical_rect()/get_screen_dpr_at() to correctly place the
+    # overlay on a scaled display (see xgen/utils/dpi.py). That conversion is
+    # environment-dependent: on an unscaled display (e.g. this sandbox, or a
+    # monitor at 100% Windows scaling) it's a no-op, but on any other scaling
+    # (125%, 150%, ...) it legitimately shrinks/grows the logical geometry, which
+    # would make this test's exact-pixel assertions flaky depending on the
+    # machine's actual display settings. Pin the scale factor to 1.0 so this test
+    # verifies the insetting math on its own, independent of the host's DPI.
+    monkeypatch.setattr("xgen.utils.dpi.get_screen_dpr_at", lambda x, y: 1.0)
+
     overlay = OverlayWindow()
     target_rect = Rect(left=100, top=150, right=300, bottom=250)
 

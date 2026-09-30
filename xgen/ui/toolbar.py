@@ -215,7 +215,7 @@ class Toolbar(QToolBar):
             "QPushButton:hover { background: #222834; color: #ffffff; border-color: #8b5cf6; }"
             "QPushButton:checked { background: #3b0764; color: #d8b4fe; border-color: #8b5cf6; font-weight: 600; }"
         )
-        self.btn_pin.toggled.connect(self.pin_toggled.emit)
+        self.btn_pin.toggled.connect(self._on_pin_toggled)
         center_layout.addWidget(self.btn_pin)
 
         layout.addWidget(self.center_container)
@@ -432,6 +432,11 @@ class Toolbar(QToolBar):
             "QPushButton:hover { background: #222834; color: #ffffff; border-color: #3b82f6; }"
         )
         self.btn_timed.blockSignals(False)
+
+    def _on_pin_toggled(self, checked: bool) -> None:
+        """Reflect the Pin button's checked state in its label, then forward the signal."""
+        self.btn_pin.setText("📌 Pinned" if checked else "📌 Pin")
+        self.pin_toggled.emit(checked)
 
     def set_refreshing(self, refreshing: bool) -> None:
         """Update refresh button state, text, style, and enabled flag during tree fetch."""
