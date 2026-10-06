@@ -91,7 +91,23 @@ class PlatformBackend(Protocol):
     # --- Window enumeration / hit-testing ---
 
     def get_open_windows(self) -> List["WindowTarget"]:
-        """Visible top-level application windows, Desktop Root first. [Desktop Root] only if unavailable."""
+        """Inspectable targets for the picker, most relevant first.
+
+        What counts as a target differs by platform, which is what
+        supports_desktop_root() below describes: on Windows these are top-level
+        windows led by the Desktop Root pseudo-target; on macOS they are
+        running applications, frontmost first, with no root entry at all.
+        """
+        ...
+
+    def supports_desktop_root(self) -> bool:
+        """Whether one session can span the whole desktop.
+
+        True on Windows, where WinAppDriver's Root target inspects every
+        application at once. False on macOS: an Appium Mac2 (XCUITest) session
+        attaches to a single application, so offering a desktop-wide entry
+        would promise something no Mac session can deliver.
+        """
         ...
 
     def window_from_point(self, x: int, y: int) -> Optional[int]:

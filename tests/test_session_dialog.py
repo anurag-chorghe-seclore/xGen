@@ -18,6 +18,32 @@ def qapp():
     return app
 
 
+@pytest.fixture(autouse=True)
+def stub_window_list(monkeypatch):
+    """Give the target picker a fixed Windows-shaped window list.
+
+    These tests assert what the picker does with its entries — that index 0 is
+    Desktop Root, that a saved handle gets reselected. Left unstubbed they ask
+    the host what windows it has open, which makes them depend on the machine:
+    on a headless macOS runner the real enumeration returns nothing at all, the
+    combo is empty, and currentData() is None for reasons that have nothing to
+    do with the dialog's behaviour.
+    """
+    from xgen.utils.window_finder import _DESKTOP_ROOT
+
+    windows = [
+        _DESKTOP_ROOT,
+        WindowTarget(
+            title="Notepad",
+            handle_hex="0x000E07FA",
+            hwnd=0x000E07FA,
+            exe_name="notepad.exe",
+        ),
+    ]
+    monkeypatch.setattr("xgen.ui.session_dialog.get_open_windows", lambda: list(windows))
+    return windows
+
+
 def test_session_dialog_initialization_with_app_path(qapp):
     cfg = XGenConfig(appium_url="http://127.0.0.1:4723", app_path="C:\\app.exe")
     mgr = SessionManager()

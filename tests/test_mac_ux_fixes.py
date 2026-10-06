@@ -198,3 +198,25 @@ def test_an_ordinary_element_rect_is_not_suppressed(qapp, monkeypatch):
 
     overlay = _overlay(qapp)
     assert overlay._is_fullscreen_rect(Rect(100, 100, 300, 160)) is False
+
+
+def test_building_the_panel_creates_no_stray_top_level_window(qapp):
+    """
+    Regression: apply_driver_dialect() used to run while the header row was
+    still being assembled. addWidget() on a layout that is not yet installed on
+    a widget does not reparent, so chk_prefix was still parentless at that
+    point — and setVisible(True) on a parentless widget makes Qt show it as its
+    own top-level window. A stray always-there window broke the pin-toggle test
+    and would have been visible to users.
+    """
+    from PyQt6.QtWidgets import QApplication
+    from xgen.ui.xpath_panel import XPathPanel
+
+    DriverDialectStore.instance().set_active(WINDOWS_DIALECT)
+    before = {id(w) for w in QApplication.topLevelWidgets() if w.isVisible()}
+
+    panel = XPathPanel()
+    after = {id(w) for w in QApplication.topLevelWidgets() if w.isVisible()}
+
+    assert after == before, "building the panel must not show any new top-level window"
+    assert panel.chk_prefix.parent() is not None, "the toggle must end up parented"

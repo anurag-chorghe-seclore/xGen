@@ -182,8 +182,20 @@ def test_xpath_panel_generation_and_prefix_toggle(qapp):
     assert xpath_panel._candidates[0].xpath.startswith("//Window")
 
 
-def test_main_window_assembly(qapp):
+def test_main_window_assembly(qapp, monkeypatch):
     import time
+
+    # The picker's contents come from the host otherwise, and what it offers is
+    # platform-specific by design: Windows leads with the Desktop Root
+    # pseudo-target, macOS lists running applications and has no root at all.
+    # This test is about how MainWindow is assembled, not about either, so give
+    # it a fixed Windows-shaped list instead of whatever the runner has open.
+    import xgen.utils.window_finder as wf
+    monkeypatch.setattr(wf, "get_open_windows", lambda: [
+        wf._DESKTOP_ROOT,
+        wf.WindowTarget(title="Notepad", handle_hex="0x000E07FA",
+                        hwnd=0x000E07FA, exe_name="notepad.exe"),
+    ])
 
     cfg = XGenConfig(auto_connect_on_startup=False)
     win = MainWindow(cfg, start_hooks=False)
@@ -325,8 +337,20 @@ def test_main_window_pin_toggle(qapp):
     WS_EX_TOPMOST = 0x00000008
     GWL_EXSTYLE = -20
 
+    # WS_EX_TOPMOST is a property of a real HWND, so this can only be checked
+    # when Qt is actually creating native windows. Under the "offscreen"
+    # platform plugin -- which is how CI runs, for determinism and because the
+    # macOS runner is headless -- winId() returns a placeholder that is not an
+    # HWND at all, GetWindowLongW on it returns 0, and the assertions below
+    # fail for a reason that has nothing to do with pinning.
+    native_windows = (
+        platform.system() == "Windows"
+        and QApplication.instance() is not None
+        and QApplication.instance().platformName() == "windows"
+    )
+
     def is_topmost(hwnd: int) -> bool:
-        if platform.system() != "Windows":
+        if not native_windows:
             return False
         user32 = ctypes.windll.user32
         user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -339,15 +363,15 @@ def test_main_window_pin_toggle(qapp):
     win.show()
     QApplication.processEvents()
 
-    if platform.system() == "Windows":
+    if native_windows:
         assert not is_topmost(int(win.winId())), "Should not be topmost initially"
     win.toolbar.btn_pin.click()  # Pin ON
     QApplication.processEvents()
-    if platform.system() == "Windows":
+    if native_windows:
         assert is_topmost(int(win.winId())), "Should be topmost after clicking Pin"
     win.toolbar.btn_pin.click()  # Pin OFF
     QApplication.processEvents()
-    if platform.system() == "Windows":
+    if native_windows:
         assert not is_topmost(int(win.winId())), "Should not be topmost after clicking Unpin"
 
     win.session_manager.close()
@@ -359,7 +383,7 @@ def test_main_window_pin_toggle(qapp):
     win2 = MainWindow(cfg2, start_hooks=False)
     win2.show()
     QApplication.processEvents()  # Let singleShot(0) fire
-    if platform.system() == "Windows":
+    if native_windows:
         assert is_topmost(int(win2.winId())), "Should be topmost when restored from config"
 
     win2.toolbar.btn_pin.setChecked(False)  # Unpin cleanly before closing
@@ -521,7 +545,6 @@ def test_is_point_outside_xgen_ignores_own_overlay_hwnd(qapp, monkeypatch):
     wrongly suppress hover resolution for the real app underneath) -- but a point
     genuinely over some other xGen-owned window must still be suppressed."""
     import os
-    from PyQt6.QtCore import QRect
 
     cfg = XGenConfig(auto_connect_on_startup=False)
     win = MainWindow(cfg, start_hooks=False)
@@ -539,11 +562,28 @@ def test_is_point_outside_xgen_ignores_own_overlay_hwnd(qapp, monkeypatch):
             def get_process_id_for_window(self, hwnd):
                 return own_pid
 
+            def uses_physical_pixel_coords(self) -> bool:
+                # This is a Windows regression test and Windows reports
+                # physical pixels. Needed because _snapshot_dpr_at asks the
+                # backend which coordinate convention is in play before
+                # scaling anything.
+                return True
+
         # Isolate step 1 (the PID/HWND short-circuit under test) from the later
-        # geometry/taskbar checks: force "not inside xGen's own frame" and skip the
-        # taskbar branch entirely, regardless of the sandbox's actual screen size.
-        monkeypatch.setattr(win, "frameGeometry", lambda: QRect(-5000, -5000, 1, 1))
-        monkeypatch.setattr(QApplication, "instance", staticmethod(lambda: None))
+        # geometry and work-area checks. Those no longer read frameGeometry() or
+        # QScreen live: the filter runs on pynput's listener thread, where Qt
+        # objects are off limits, so it reads the plain-data snapshot that
+        # refresh_hover_filter_snapshot() caches. Pin that snapshot instead —
+        # a window frame far from the probe point, and one screen whose work
+        # area contains it, so only step 1 can decide the result.
+        win._hover_overlay_id = overlay_hwnd
+        win._hover_frame_rect = (-5000, -5000, -4999, -4999)
+        win._hover_screens = [{
+            "dpr": 1.0,
+            "phys": (0, 0, 4000, 4000),
+            "logical": (0, 0, 4000, 4000),
+            "avail": (0, 0, 4000, 4000),
+        }]
 
         # Case 1: WindowFromPoint reports our own overlay's HWND -- must NOT be
         # treated as "inside xGen" (the overlay is deliberately click-through).

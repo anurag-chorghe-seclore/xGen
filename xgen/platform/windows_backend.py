@@ -331,6 +331,10 @@ class WindowsBackend:
     # _is_point_outside_xgen)
     # ------------------------------------------------------------------
 
+    def supports_desktop_root(self) -> bool:
+        """WinAppDriver's Root target inspects every application at once."""
+        return True
+
     def get_open_windows(self) -> List[WindowTarget]:
         results: List[WindowTarget] = [_DESKTOP_ROOT]
         try:

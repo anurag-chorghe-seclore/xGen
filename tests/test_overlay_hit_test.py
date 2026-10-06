@@ -332,3 +332,69 @@ def test_a_resolved_element_resets_the_empty_streak(qapp, monkeypatch):
         mode._poll_hover()
 
     assert overlay.hidden_calls == 0
+
+
+# ----------------------------------------------------------------------
+# PyObjC thread safety
+# ----------------------------------------------------------------------
+
+def test_backend_entry_points_open_an_autorelease_pool(monkeypatch):
+    """
+    Every PyObjC call autoreleases its result into the *calling thread's* pool.
+    The main thread always has one; a bare Python thread does not, and on macOS
+    the missing pool is a segfault rather than a leak. xGen enumerates windows
+    on a background thread and runs the hover filter on pynput's listener
+    thread, so those entry points must open a pool before touching PyObjC.
+
+    This is the regression guard for the segfault that killed the first live
+    macOS CI run, where the background enumeration thread and the main thread
+    were inside AppKit at the same time.
+    """
+    import xgen.platform.mac_backend as mb
+
+    opened = {"count": 0, "depth": 0, "max_depth": 0}
+
+    class _TrackingPool:
+        def __enter__(self):
+            opened["count"] += 1
+            opened["depth"] += 1
+            opened["max_depth"] = max(opened["max_depth"], opened["depth"])
+            return self
+
+        def __exit__(self, *exc):
+            opened["depth"] -= 1
+            return False
+
+    monkeypatch.setattr(MacBackend, "_autorelease_pool", staticmethod(_TrackingPool))
+    _patch_quartz(monkeypatch, [_window_info(900, 1234)])
+
+    backend = MacBackend()
+
+    backend.get_open_windows()
+    assert opened["count"] >= 1, "get_open_windows runs on a background thread"
+
+    before = opened["count"]
+    backend.window_from_point(10, 10)
+    assert opened["count"] > before, "window_from_point runs on pynput's thread"
+
+    before = opened["count"]
+    backend.get_process_id_for_window(900)
+    assert opened["count"] > before, "get_process_id_for_window runs on pynput's thread"
+
+    assert opened["depth"] == 0, "every pool opened must also be closed"
+
+
+def test_ns_window_lookup_refuses_to_run_off_the_main_thread(monkeypatch):
+    """winId() can create the native handle, and that is an AppKit mutation.
+    Off the main thread it segfaults instead of raising, so it has to refuse."""
+    import xgen.platform.mac_backend as mb
+
+    monkeypatch.setattr(mb, "HAS_OBJC", True)
+    monkeypatch.setattr(MacBackend, "_on_main_thread", staticmethod(lambda: False))
+
+    class _ExplodingWidget:
+        def winId(self):  # noqa: N802
+            raise AssertionError("winId() must not be touched off the main thread")
+
+    assert MacBackend._ns_window_for_widget(_ExplodingWidget()) is None
+    assert MacBackend().native_window_id_for_widget(_ExplodingWidget()) is None

@@ -50,6 +50,7 @@ call site keeps working unmodified. See _to_pseudo_physical()/_to_ax_points().
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -88,11 +89,12 @@ except ImportError:
     HAS_QUARTZ = False
 
 try:
-    from AppKit import NSScreen, NSRunningApplication, NSWorkspace
+    from AppKit import NSScreen, NSRunningApplication, NSThread, NSWorkspace
     HAS_APPKIT = True
 except ImportError:
     NSScreen = None       # type: ignore
     NSRunningApplication = None  # type: ignore
+    NSThread = None       # type: ignore
     NSWorkspace = None    # type: ignore
     HAS_APPKIT = False
 
@@ -169,6 +171,39 @@ class MacBackend:
     def _click_through_window_ids(self) -> set:
         """CGWindowIDs of our own click-through windows, for hit-tests to skip."""
         return set(self._click_through_ids.values())
+
+    @staticmethod
+    def _autorelease_pool():
+        """Give the calling thread an autorelease pool for the duration of a block.
+
+        Every PyObjC call that returns an Objective-C object autoreleases it
+        into the *current thread's* pool. The main thread always has one — the
+        AppKit run loop drains it each pass — but a bare Python thread does
+        not, so objects autoreleased there belong to no pool at all. On macOS
+        that is not a leak, it is a crash: the eventual release lands against
+        another thread's pool and the process dies with a segfault.
+
+        This is exactly what killed the first live macOS CI run. xGen enumerates
+        windows on a background thread (see MainWindow._refresh_window_picker,
+        which moved that work off the UI thread to fix the Windows Refresh-button
+        ANR, where EnumWindows can block on another app's stuck message loop).
+        That was safe on Windows and fatal here. So every backend entry point
+        that both touches PyObjC and can be reached from a non-GUI thread opens
+        a pool first.
+        """
+        if HAS_OBJC and hasattr(objc, "autorelease_pool"):
+            return objc.autorelease_pool()
+        return contextlib.nullcontext()
+
+    @staticmethod
+    def _on_main_thread() -> bool:
+        """Whether the caller is the main (AppKit) thread."""
+        if not HAS_APPKIT:
+            return True  # can't tell; assume the caller knows what it's doing
+        try:
+            return bool(NSThread.isMainThread())
+        except Exception:
+            return True
 
     # ------------------------------------------------------------------
     # Accessibility
@@ -323,28 +358,33 @@ class MacBackend:
         if not HAS_AX:
             return None
         try:
-            ax_x, ax_y = float(x), float(y)
-            system_wide = AXFW.AXUIElementCreateSystemWide()
-            err, element = AXFW.AXUIElementCopyElementAtPosition(system_wide, ax_x, ax_y, None)
-            if err != 0 or element is None:
-                return None
-
-            # The highlight overlay sits at the maximum window level, right
-            # under the cursor, and the accessibility hit-test honours window
-            # order rather than setIgnoresMouseEvents_ — so without this the
-            # system-wide hit-test keeps returning xGen's own overlay instead
-            # of the element it is drawn around. Re-enter through the topmost
-            # window at that point that belongs to another process.
-            if self._pid_for_element(element) == os.getpid():
-                element = self._foreign_app_element_at(ax_x, ax_y)
-                if element is None:
-                    return None
-
-            best = self._drill_down(element, ax_x, ax_y)
-            return self._element_to_native(best)
+            # The click path reaches this from the mouse-hook thread.
+            with self._autorelease_pool():
+                return self._element_from_point_pooled(float(x), float(y))
         except Exception as e:
             logger.debug("element_from_point failed at (%d, %d): %s", x, y, e)
             return None
+
+    def _element_from_point_pooled(self, ax_x: float, ax_y: float) -> Optional[NativeElement]:
+        """element_from_point's body, with an autorelease pool already open."""
+        system_wide = AXFW.AXUIElementCreateSystemWide()
+        err, element = AXFW.AXUIElementCopyElementAtPosition(system_wide, ax_x, ax_y, None)
+        if err != 0 or element is None:
+            return None
+
+        # The highlight overlay sits at the maximum window level, right under
+        # the cursor, and the accessibility hit-test honours window order
+        # rather than setIgnoresMouseEvents_ — so without this the system-wide
+        # hit-test keeps returning xGen's own overlay instead of the element it
+        # is drawn around. Re-enter through the topmost window at that point
+        # that belongs to another process.
+        if self._pid_for_element(element) == os.getpid():
+            element = self._foreign_app_element_at(ax_x, ax_y)
+            if element is None:
+                return None
+
+        best = self._drill_down(element, ax_x, ax_y)
+        return self._element_to_native(best)
 
     def walk_subtree(
         self,
@@ -445,6 +485,10 @@ class MacBackend:
     # Window enumeration / hit-testing
     # ------------------------------------------------------------------
 
+    def supports_desktop_root(self) -> bool:
+        """No macOS equivalent exists: a Mac2 session attaches to one app."""
+        return False
+
     def get_open_windows(self) -> List[WindowTarget]:
         """Running *applications*, frontmost first — not windows, and no Desktop Root.
 
@@ -460,7 +504,10 @@ class MacBackend:
         if not HAS_QUARTZ:
             return []
         try:
-            return self._enumerate_applications_cg()
+            # Runs on a background thread (MainWindow._refresh_window_picker),
+            # so it needs its own autorelease pool — see _autorelease_pool.
+            with self._autorelease_pool():
+                return self._enumerate_applications_cg()
         except Exception:
             logger.exception("Application enumeration failed; returning an empty list.")
             return []
@@ -559,10 +606,12 @@ class MacBackend:
         if not HAS_QUARTZ:
             return None
         try:
-            hits = self._windows_at_point(float(x), float(y))
-            if not hits:
-                return None
-            return int(hits[0].get("kCGWindowNumber", 0))
+            # Called from pynput's listener thread via the hover filter.
+            with self._autorelease_pool():
+                hits = self._windows_at_point(float(x), float(y))
+                if not hits:
+                    return None
+                return int(hits[0].get("kCGWindowNumber", 0))
         except Exception:
             return None
 
@@ -570,10 +619,12 @@ class MacBackend:
         if not HAS_QUARTZ or not hwnd:
             return None
         try:
-            desc = Quartz.CGWindowListCreateDescriptionFromArray([hwnd]) or []
-            if desc:
-                return int(desc[0].get("kCGWindowOwnerPID", 0)) or None
-            return None
+            # Also reached from pynput's listener thread.
+            with self._autorelease_pool():
+                desc = Quartz.CGWindowListCreateDescriptionFromArray([hwnd]) or []
+                if desc:
+                    return int(desc[0].get("kCGWindowOwnerPID", 0)) or None
+                return None
         except Exception:
             return None
 
@@ -592,8 +643,38 @@ class MacBackend:
         """
         if not HAS_OBJC:
             return None
+        # winId() can *create* the native handle, which is an AppKit mutation,
+        # and ns_view.window() is AppKit too. Neither is safe anywhere but the
+        # main thread — off it, the result is a segfault rather than an
+        # exception, so refuse instead of letting a caller find out the hard
+        # way. Callers already treat None as "can't identify our own windows".
+        if not MacBackend._on_main_thread():
+            logger.debug("Refusing to resolve an NSWindow off the main thread.")
+            return None
+
+        # Only Qt's "cocoa" platform plugin backs a QWidget with a real NSView.
+        # Under "offscreen" or "minimal" — how the test suite, CI and any
+        # headless run work — there are no native Cocoa windows at all, and
+        # winId() returns a placeholder handle that is not an Objective-C
+        # object. Wrapping it hands PyObjC a bogus pointer to send messages to,
+        # and the result is a segmentation fault, not an exception, so the
+        # try/except below cannot catch it and the whole process dies. Check
+        # the plugin rather than trusting winId() to mean on every platform
+        # what it means on a real desktop.
+        try:
+            from PyQt6.QtGui import QGuiApplication
+            app = QGuiApplication.instance()
+            if app is None or app.platformName() != "cocoa":
+                logger.debug("Qt platform plugin is not cocoa; no NSWindow to resolve.")
+                return None
+        except Exception as e:
+            logger.debug("Could not determine the Qt platform plugin: %s", e)
+            return None
+
         try:
             view_ptr = int(widget.winId())  # type: ignore[attr-defined]
+            if not view_ptr:
+                return None
             ns_view = objc.objc_object(c_void_p=view_ptr)
             return ns_view.window()
         except Exception as e:
@@ -697,8 +778,9 @@ class MacBackend:
     def get_physical_cursor_pos(self) -> Tuple[int, int]:
         if HAS_QUARTZ:
             try:
-                loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-                return int(round(loc.x)), int(round(loc.y))
+                with self._autorelease_pool():
+                    loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+                    return int(round(loc.x)), int(round(loc.y))
             except Exception:
                 pass
         # Fall through to the same Qt-based fallback WindowsBackend uses when the native call fails.

@@ -8,14 +8,30 @@ import pytest
 from xgen.utils.window_finder import WindowTarget, get_open_windows
 
 
-def test_desktop_root_is_always_first():
+def test_desktop_root_leads_the_list_only_where_the_platform_has_one():
+    """Desktop Root is a Windows concept, not a universal one.
+
+    WinAppDriver's Root target inspects every application at once, so there it
+    is always entry 0. An Appium Mac2 session attaches to a single application
+    and macOS has no desktop-wide equivalent, so a root entry there would
+    promise something no session can deliver — and picking it would silently
+    land the user on Finder. The backend states which world it is in; this
+    asserts the matching contract rather than assuming Windows.
+    """
+    from xgen.platform.factory import get_platform_backend
+
     windows = get_open_windows()
-    assert len(windows) >= 1
-    root = windows[0]
-    assert root.is_root is True
-    assert root.handle_hex == ""
-    assert root.hwnd == 0
-    assert "Desktop Root" in root.display_label()
+    if get_platform_backend().supports_desktop_root():
+        assert len(windows) >= 1
+        root = windows[0]
+        assert root.is_root is True
+        assert root.handle_hex == ""
+        assert root.hwnd == 0
+        assert "Desktop Root" in root.display_label()
+    else:
+        assert not any(w.is_root for w in windows), (
+            "a platform without a desktop-wide target must not offer a root entry"
+        )
 
 
 def test_window_target_display_label():

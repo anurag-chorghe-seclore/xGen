@@ -425,7 +425,6 @@ class XPathPanel(QWidget):
         )
         self.chk_prefix.toggled.connect(self._on_prefix_toggled)
         header_row.addWidget(self.chk_prefix)
-        self.apply_driver_dialect()
         main_layout.addLayout(header_row)
 
         # 2. Scroll Area containing candidate cards
@@ -443,6 +442,14 @@ class XPathPanel(QWidget):
 
         self.scroll_area.setWidget(self.card_container)
         main_layout.addWidget(self.scroll_area)
+
+        # Last, not while the header row is being assembled: addWidget() on a
+        # layout that is not yet installed on a widget does NOT reparent, so
+        # until main_layout.addLayout(header_row) runs, chk_prefix is still a
+        # parentless widget — and setVisible(True) on one of those makes Qt
+        # show it as its own top-level window. That stray window is what broke
+        # the pin-toggle test.
+        self.apply_driver_dialect()
 
     def populate(
         self,
@@ -543,7 +550,14 @@ class XPathPanel(QWidget):
         """
         dialect = active_dialect()
         supported = getattr(dialect, "supports_window_prefix", True)
-        self.chk_prefix.setVisible(supported)
+        # setVisible(True) on a widget with no parent shows it as a top-level
+        # window of its own, so never un-hide one that isn't parented yet.
+        # Hiding is always safe.
+        if supported:
+            if self.chk_prefix.parent() is not None:
+                self.chk_prefix.setVisible(True)
+        else:
+            self.chk_prefix.setVisible(False)
         if not supported and self.chk_prefix.isChecked():
             # Clear it rather than leave a hidden control silently padding
             # every generated selector with a prefix that anchors nothing.

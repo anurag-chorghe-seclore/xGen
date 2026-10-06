@@ -45,6 +45,9 @@ class UnsupportedBackend:
 
     # --- Window enumeration / hit-testing ---
 
+    def supports_desktop_root(self) -> bool:
+        return True
+
     def get_open_windows(self) -> List:
         from xgen.utils.window_finder import _DESKTOP_ROOT
         return [_DESKTOP_ROOT]
