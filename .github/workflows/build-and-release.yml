@@ -1,6 +1,15 @@
 name: Build, Preview & Release xGen
 
 on:
+  # CI: every push and PR runs the suite on both target platforms. Packaging
+  # is NOT run here — PyInstaller can't cross-compile, so each artifact costs
+  # a full runner, which isn't worth it per commit.
+  push:
+    branches: [main, master, dev]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master, dev]
+
   # Manual trigger from GitHub Actions UI or GitHub CLI
   workflow_dispatch:
     inputs:
@@ -26,9 +35,66 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  # ====================================================================
+  # CI — runs on every push and PR, on both platforms
+  # ====================================================================
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A Windows failure must not cancel the macOS job. When something breaks
+      # on exactly one platform, knowing *which* is the entire diagnosis.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    # Both runners are headless. Qt needs a platform plugin it can actually
+    # instantiate QWidgets against, or every widget test aborts the process
+    # rather than failing a test.
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install .[dev]
+
+      # pyproject marks uiautomation/pywin32 win32-only and the pyobjc
+      # packages darwin-only, so this also confirms the markers resolved the
+      # way each platform expects.
+      - name: Show Resolved Environment
+        run: |
+          python -c "import sys, platform; print(sys.version); print(platform.platform())"
+          pip list
+
+      - name: Run Test Suite
+        run: python -m pytest tests -v --color=yes
+
+      - name: Smoke-Import The Application
+        run: python -c "import xgen.main; print('xGen imports cleanly')"
+
+  # ====================================================================
+  # Packaging — tags and manual runs only, and only once tests are green
+  # ====================================================================
+  build-windows:
     name: Build & Package Windows App
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
 
     steps:
@@ -43,14 +109,10 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Build & Test Dependencies
+      - name: Install Build Dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install .[dev]
-
-      - name: Run Test Suite
-        run: |
-          python -m pytest tests -v --color=yes
 
       - name: Determine Build Metadata & Names
         id: meta
@@ -59,7 +121,7 @@ jobs:
           $shortSha = $env:GITHUB_SHA.Substring(0, 7)
           $isTag = $env:GITHUB_REF -like "refs/tags/v*"
           $manualRelease = ("${{ github.event.inputs.build_type }}" -eq "release")
-          
+
           if ($isTag) {
             $tag = $env:GITHUB_REF_NAME
             $isRelease = $true
@@ -72,12 +134,12 @@ jobs:
           }
 
           $zipName = "xGen-$tag-windows-x64.zip"
-          
+
           echo "TAG_NAME=$tag" >> $env:GITHUB_ENV
           echo "IS_RELEASE=$isRelease" >> $env:GITHUB_ENV
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
           echo "SHORT_SHA=$shortSha" >> $env:GITHUB_ENV
-          
+
           Write-Host "Build Target: $tag"
           Write-Host "Is Official Release: $isRelease"
           Write-Host "Zip Archive Name: $zipName"
@@ -98,11 +160,11 @@ jobs:
           # Create standardized zip archive
           $zipPath = "dist/$env:ZIP_NAME"
           Compress-Archive -Path "$distFolder/*" -DestinationPath $zipPath -CompressionLevel Optimal
-          
+
           # Generate SHA256 checksum
           $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
           "$hash  $env:ZIP_NAME" | Out-File -FilePath "$zipPath.sha256" -Encoding utf8
-          
+
           Write-Host "Created Archive: $zipPath"
           Write-Host "SHA256 Checksum: $hash"
 
@@ -115,6 +177,115 @@ jobs:
             dist/${{ env.ZIP_NAME }}.sha256
           retention-days: 30
 
+      - name: Publish GitHub Release
+        if: env.IS_RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "xGen ${{ env.TAG_NAME }}"
+          draft: false
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          generate_release_notes: true
+          files: |
+            dist/${{ env.ZIP_NAME }}
+            dist/${{ env.ZIP_NAME }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    name: Build & Package macOS App
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Build Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install .[dev]
+
+      - name: Determine Build Metadata & Names
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IS_TAG=false
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then IS_TAG=true; fi
+          MANUAL_RELEASE=false
+          if [[ "${{ github.event.inputs.build_type }}" == "release" ]]; then MANUAL_RELEASE=true; fi
+
+          if [[ "$IS_TAG" == "true" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            IS_RELEASE=true
+          elif [[ "$MANUAL_RELEASE" == "true" && -n "${{ github.event.inputs.release_tag }}" ]]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+            IS_RELEASE=true
+          else
+            TAG="preview-$SHORT_SHA"
+            IS_RELEASE=false
+          fi
+
+          ZIP_NAME="xGen-$TAG-macos-arm64.zip"
+
+          echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
+          echo "IS_RELEASE=$IS_RELEASE" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+
+          echo "Build Target: $TAG"
+          echo "Is Official Release: $IS_RELEASE"
+          echo "Zip Archive Name: $ZIP_NAME"
+
+      - name: Build Standalone macOS App Bundle (.app)
+        run: |
+          python build_exe.py
+
+      - name: Verify Bundle Is Retina-Capable
+        run: |
+          if [ ! -d "dist/xGen.app" ]; then
+            echo "dist/xGen.app not found!"
+            exit 1
+          fi
+          # NSHighResolutionCapable is set at packaging time only; nothing at
+          # runtime can recover from it being missing, and the symptom is a
+          # whole UI rendered upscaled and blurry on every Retina Mac. Fail
+          # the build here rather than ship that.
+          /usr/libexec/PlistBuddy -c "Print :NSHighResolutionCapable" "dist/xGen.app/Contents/Info.plist"
+
+      - name: Package Distribution Zip & Generate Checksums
+        run: |
+          # ditto (not zip -r) preserves the .app bundle's structure/metadata correctly.
+          ditto -c -k --sequesterRsrc --keepParent "dist/xGen.app" "dist/$ZIP_NAME"
+          shasum -a 256 "dist/$ZIP_NAME" | awk '{print $1"  '"$ZIP_NAME"'"}' > "dist/$ZIP_NAME.sha256"
+
+          echo "Created Archive: dist/$ZIP_NAME"
+          cat "dist/$ZIP_NAME.sha256"
+
+      - name: Upload Workflow Artifact (Preview & CI Build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: |
+            dist/${{ env.ZIP_NAME }}
+            dist/${{ env.ZIP_NAME }}.sha256
+          retention-days: 30
+
+      # NOTE: this .app is unsigned and not notarized (no Apple Developer ID
+      # configured in this workflow — see xgen.spec's BUNDLE() comment), so
+      # Gatekeeper will show an "unidentified developer" warning on first
+      # launch on another Mac until that's set up as a follow-up. Until then,
+      # right-click > Open, or:
+      #   xattr -dr com.apple.quarantine /Applications/xGen.app
       - name: Publish GitHub Release
         if: env.IS_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
