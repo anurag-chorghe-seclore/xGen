@@ -26,6 +26,7 @@ DIALECTS entry here and nothing else.
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Set
 
@@ -114,6 +115,15 @@ class DriverDialect:
     # hint only — the heartbeat detects an unsupported endpoint at runtime
     # rather than trusting this flag (see SessionManager._check_heartbeat).
     supports_window_handles: bool = True
+    # Whether anchoring a selector to its top-level window container is worth
+    # offering. On Windows a Desktop Root session spans every application, so
+    # the //Window prefix is what stops a selector matching the same control
+    # in a different app. A Mac2 session is already scoped to one application,
+    # and its root is XCUIElementTypeApplication rather than a window, so the
+    # prefix adds length without adding uniqueness — and adds nothing at all
+    # when the app has no XCUIElementTypeWindow ancestor to anchor to, which
+    # is why the toggle looked inert there. The UI hides it where this is False.
+    supports_window_prefix: bool = True
 
     # --- Derived helpers ---
 
@@ -294,6 +304,7 @@ MAC2_DIALECT = DriverDialect(
     # than copying limitations that aren't real here.
     disallowed_xpath_patterns=(),
     supports_window_handles=False,
+    supports_window_prefix=False,
 )
 
 
@@ -347,25 +358,36 @@ class DriverDialectStore:
     """
 
     _instance: Optional["DriverDialectStore"] = None
+    _instance_lock = threading.Lock()
 
     def __init__(self) -> None:
+        # set_active is called from the GUI thread (SessionManager.connect) and
+        # from the session worker thread (once the server confirms which driver
+        # answered), while the fetcher thread reads it during TreeParser.parse.
+        # Reads are cheap, so a plain lock keeps them from tearing.
+        self._lock = threading.RLock()
         self._active: DriverDialect = DEFAULT_DIALECT
 
     @classmethod
     def instance(cls) -> "DriverDialectStore":
         if cls._instance is None:
-            cls._instance = DriverDialectStore()
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = DriverDialectStore()
         return cls._instance
 
     @property
     def active(self) -> DriverDialect:
-        return self._active
+        with self._lock:
+            return self._active
 
     def set_active(self, dialect: DriverDialect) -> None:
-        self._active = dialect
+        with self._lock:
+            self._active = dialect
 
     def reset(self) -> None:
-        self._active = DEFAULT_DIALECT
+        with self._lock:
+            self._active = DEFAULT_DIALECT
 
 
 def active_dialect() -> DriverDialect:

@@ -131,6 +131,22 @@ class PlatformBackend(Protocol):
         """Opt the process into per-monitor DPI awareness before any UI is created. No-op if not applicable."""
         ...
 
+    def uses_physical_pixel_coords(self) -> bool:
+        """
+        Whether this backend's screen coordinates are *physical pixels* that
+        still need dividing by the display scale factor to reach Qt's logical
+        space (True on Windows), or are already in that space (False on macOS,
+        where both the accessibility API and the Appium Mac2 driver speak
+        points).
+
+        This is what keeps the three coordinate sources — native hit-testing,
+        the driver's element rects, and Qt's own geometry — in one space. Get
+        it wrong and nothing crashes: highlights land at half size and element
+        matching quietly fails, because two of the three sources disagree by
+        exactly the scale factor.
+        """
+        ...
+
     def get_physical_cursor_pos(self) -> Tuple[int, int]:
         """Current mouse cursor position in physical (not DPI-scaled) screen pixels."""
         ...

@@ -369,96 +369,62 @@ class SessionManager(QObject):
                 data = r_sessions.json()
                 active_list = data.get("value", [])
                 if isinstance(active_list, list) and len(active_list) > 0:
+                    reusable = self._find_reusable_session(
+                        active_list,
+                        dialect,
+                        app_target=app_target,
+                        app_window=app_window,
+                        bundle_id=bundle_id,
+                    )
+
+                    if reusable is not None:
+                        sid, existing_app = reusable
+                        logger.info("Reusing compatible Appium session: %s (target: %s)", sid, existing_app or "Root")
+                        self._session_id = str(sid)
+                        windows = self._refresh_handles_internal()
+                        active_handle = app_window or (windows[0].handle if windows else "")
+
+                        app_name = existing_app or "Desktop Root"
+                        if app_window:
+                            try:
+                                norm_target = normalize_handle(app_window)
+                                for w in get_open_windows():
+                                    if w.hwnd and normalize_handle(w.hwnd) == norm_target:
+                                        app_name = w.title or w.exe_name or f"Window {app_window}"
+                                        break
+                                else:
+                                    app_name = f"Window {app_window}"
+                            except Exception:
+                                app_name = f"Window {app_window}"
+                        elif app_name.lower() == "root":
+                            app_name = "Desktop Root"
+                        elif "\\" in app_name or "/" in app_name:
+                            app_name = Path(app_name).stem
+
+                        return SessionInfo(
+                            session_id=str(sid),
+                            appium_url=base,
+                            app_name=str(app_name),
+                            windows=windows,
+                            active_handle=active_handle
+                        )
+
+                    # Nothing on the server matches what was asked for. Standalone
+                    # WinAppDriver only hosts one session at a time, so the existing
+                    # one is cleared to make room — same behavior as before.
                     first_sess = active_list[0]
                     sid = first_sess.get("id") or first_sess.get("sessionId")
                     if sid:
-                        caps = first_sess.get("capabilities", {})
-
-                        # Never reuse a session belonging to a different driver
-                        # (a leftover Windows session when the user now wants a
-                        # Mac one would otherwise look reusable).
-                        existing_dialect = dialect_from_capabilities(caps)
-                        if existing_dialect is not None and existing_dialect.key != dialect.key:
-                            should_reuse = False
-                            existing_app = ""
-                        elif is_mac:
-                            existing_bundle = (caps.get("appium:bundleId") or caps.get("bundleId") or "").strip()
-                            existing_app_path = (caps.get("appium:appPath") or caps.get("appPath") or "").strip()
-                            existing_app = existing_bundle or existing_app_path
-                            wanted = bundle_id or app_target
-                            should_reuse = bool(wanted) and wanted in (existing_bundle, existing_app_path)
-                        else:
-                            existing_app = (caps.get("appium:app") or caps.get("app") or "").strip()
-                            existing_window_cap = (
-                                caps.get("appium:appTopLevelWindow")
-                                or caps.get("appTopLevelWindow")
-                                or ""
-                            )
-
-                            # Determine if reuse is appropriate
-                            user_wants_root = not app_target and not app_window
-                            existing_is_root = existing_app in ("Root", "", "root")
-                            existing_is_window = bool(existing_window_cap)
-
-                            try:
-                                same_app = (
-                                    existing_app
-                                    and app_target
-                                    and Path(existing_app).resolve() == Path(app_target).resolve()
-                                )
-                            except (OSError, ValueError):
-                                same_app = existing_app == app_target
-
-                            same_window = (
-                                bool(app_window)
-                                and existing_is_window
-                                and normalize_handle(existing_window_cap) == normalize_handle(app_window)
-                            )
-
-                            should_reuse = (
-                                (user_wants_root and existing_is_root)
-                                or same_app
-                                or same_window
-                            )
-
-                        if should_reuse:
-                            logger.info("Reusing compatible Appium session: %s (app: %s)", sid, existing_app or "Root")
-                            self._session_id = str(sid)
-                            windows = self._refresh_handles_internal()
-                            active_handle = app_window or (windows[0].handle if windows else "")
-
-                            app_name = existing_app or "Active Session"
-                            if app_window:
-                                try:
-                                    norm_target = normalize_handle(app_window)
-                                    for w in get_open_windows():
-                                        if w.hwnd and normalize_handle(w.hwnd) == norm_target:
-                                            app_name = w.title or w.exe_name or f"Window {app_window}"
-                                            break
-                                    else:
-                                        app_name = f"Window {app_window}"
-                                except Exception:
-                                    app_name = f"Window {app_window}"
-                            elif app_name not in ("Root", "") and "\\" in app_name:
-                                app_name = Path(app_name).stem
-
-                            return SessionInfo(
-                                session_id=str(sid),
-                                appium_url=base,
-                                app_name=str(app_name),
-                                windows=windows,
-                                active_handle=active_handle
-                            )
-                        else:
-                            logger.info(
-                                "Existing session %s targets different app (%s). Deleting old session and creating new session for: %s.",
-                                sid, existing_app or "Root", app_target or app_window or "Root"
-                            )
-                            try:
-                                self._http_session.delete(f"{base}/session/{sid}", timeout=5.0)
-                                time.sleep(0.3)
-                            except Exception as del_err:
-                                logger.warning("Could not delete old incompatible session %s: %s", sid, del_err)
+                        logger.info(
+                            "No existing session matches the requested target (%s). "
+                            "Deleting session %s and creating a new one.",
+                            app_target or app_window or bundle_id or "Desktop Root", sid,
+                        )
+                        try:
+                            self._http_session.delete(f"{base}/session/{sid}", timeout=5.0)
+                            time.sleep(0.3)
+                        except Exception as del_err:
+                            logger.warning("Could not delete old incompatible session %s: %s", sid, del_err)
         except Exception as e:
             logger.debug("Active sessions query note: %s", e)
 
@@ -502,10 +468,17 @@ class SessionManager(QObject):
                 w3c_caps["appium:bundleId"] = effective_bundle
                 if not app_name:
                     app_name = effective_bundle.split(".")[-1].title()
+            # Mac2Driver terminates the application it was attached to when the
+            # session is deleted, so without this, disconnecting xGen closes the
+            # user's app — it quit TextEdit out from under them. xGen is an
+            # inspector: it must never destroy the thing it is inspecting, so
+            # skipAppKill is on for every Mac session, not just explicit attach.
+            # (The Windows driver has no equivalent — WinAppDriver leaves the
+            # target process alone on session delete.)
+            w3c_caps["appium:skipAppKill"] = True
             if config.attach_to_running:
                 # Attach to the app as it stands instead of restarting it.
                 w3c_caps["appium:noReset"] = True
-                w3c_caps["appium:skipAppKill"] = True
 
             self._apply_extra_capabilities(w3c_caps, config)
 
@@ -611,6 +584,87 @@ class SessionManager(QObject):
             active_handle=active_handle
         )
         return info
+
+    @staticmethod
+    def _find_reusable_session(
+        sessions: List[Dict[str, Any]],
+        dialect: DriverDialect,
+        *,
+        app_target: str = "",
+        app_window: str = "",
+        bundle_id: str = "",
+    ) -> Optional[tuple]:
+        """
+        Find a session already on the server that we can *positively identify*
+        as targeting what the user asked for. Returns (session_id, target) or None.
+
+        The bar is deliberately "positively identify", not "can't prove it's
+        different". A session whose capabilities don't say what it targets —
+        which is what a stale session left by another automation tool usually
+        looks like — is unidentifiable, so xGen starts a fresh one rather than
+        silently adopting someone else's app session and labelling it Desktop
+        Root. The cost of being wrong here is high (you inspect a tree that
+        isn't the app you chose); the cost of being strict is one extra session
+        creation.
+
+        Every session is considered, not just the first: with several on the
+        server, the matching one may be any of them.
+        """
+        from xgen.utils.window_finder import normalize_handle
+
+        for sess in sessions or []:
+            if not isinstance(sess, dict):
+                continue
+            sid = sess.get("id") or sess.get("sessionId")
+            if not sid:
+                continue
+            caps = sess.get("capabilities") or {}
+            if not isinstance(caps, dict):
+                continue
+
+            # Never reuse a session belonging to a different driver (a leftover
+            # Windows session when the user now wants a Mac one).
+            existing_dialect = dialect_from_capabilities(caps)
+            if existing_dialect is not None and existing_dialect.key != dialect.key:
+                continue
+
+            if dialect.key == "mac2":
+                existing_bundle = str(caps.get("appium:bundleId") or caps.get("bundleId") or "").strip()
+                existing_app_path = str(caps.get("appium:appPath") or caps.get("appPath") or "").strip()
+                wanted = (bundle_id or app_target).strip()
+                if wanted and wanted in (existing_bundle, existing_app_path):
+                    return str(sid), existing_bundle or existing_app_path
+                continue
+
+            existing_app = str(caps.get("appium:app") or caps.get("app") or "").strip()
+            existing_window_cap = str(
+                caps.get("appium:appTopLevelWindow") or caps.get("appTopLevelWindow") or ""
+            ).strip()
+
+            user_wants_root = not app_target and not app_window
+            # An explicit "Root" and nothing else. An absent app capability is
+            # unknown, NOT root, and a session scoped to a top-level window is
+            # definitively not the desktop — either one previously satisfied
+            # this check and let a foreign app session masquerade as Desktop Root.
+            existing_is_root = existing_app.lower() == "root" and not existing_window_cap
+
+            same_app = False
+            if existing_app and app_target and existing_app.lower() != "root":
+                try:
+                    same_app = Path(existing_app).resolve() == Path(app_target).resolve()
+                except (OSError, ValueError):
+                    same_app = existing_app == app_target
+
+            same_window = bool(
+                app_window
+                and existing_window_cap
+                and normalize_handle(existing_window_cap) == normalize_handle(app_window)
+            )
+
+            if (user_wants_root and existing_is_root) or same_app or same_window:
+                return str(sid), existing_app
+
+        return None
 
     @staticmethod
     def parse_extra_capabilities(raw: str) -> Dict[str, Any]:
@@ -745,6 +799,8 @@ class SessionManager(QObject):
     def _check_heartbeat(self) -> None:
         if not self._session_id or self.state != SessionState.CONNECTED:
             return
+        if self._disconnect_requested:
+            return
 
         if self._heartbeat_probe_index >= len(self._heartbeat_probes):
             return  # no probe this driver understands; heartbeat disabled
@@ -773,19 +829,19 @@ class SessionManager(QObject):
                         )
                 elif r.status_code == 404:
                     logger.warning("Heartbeat: session expired or closed on server (HTTP 404). Session lost.")
-                    self._set_state(SessionState.LOST)
+                    self._report_session_lost()
                 else:
                     self._heartbeat_failures += 1
                     logger.warning("Heartbeat returned HTTP %d (fail %d/3).", r.status_code, self._heartbeat_failures)
                     if self._heartbeat_failures >= 3:
                         logger.warning("Heartbeat failed 3 consecutive times. Session lost.")
-                        self._set_state(SessionState.LOST)
+                        self._report_session_lost()
             except Exception as e:
                 self._heartbeat_failures += 1
                 logger.debug("Heartbeat ping timeout/exception (driver busy, fail %d/3): %s", self._heartbeat_failures, e)
                 if self._heartbeat_failures >= 3:
                     logger.warning("Heartbeat failed 3 consecutive times. Session lost.")
-                    self._set_state(SessionState.LOST)
+                    self._report_session_lost()
 
         threading.Thread(target=_ping, daemon=True).start()
 
@@ -803,6 +859,13 @@ class SessionManager(QObject):
                     logger.warning("Error aborting in-flight session %s: %s", sid, e)
             self._delete_thread = threading.Thread(target=_abort_delete, daemon=True)
             self._delete_thread.start()
+            # Clear the id too: _create_session set it on the worker thread, and
+            # everything that gates on "is there a session" (switch_window,
+            # refresh_window_handles, find_element_by_xpath, DriverRunner) checks
+            # _session_id rather than state. Leaving it set after aborting means
+            # those fire at a session we just deleted and the user gets an HTTP
+            # 404 instead of a clean "no active session".
+            self._session_id = None
             self._set_state(SessionState.DISCONNECTED)
             return
 
@@ -833,6 +896,19 @@ class SessionManager(QObject):
         if self.session_info:
             self.session_info.windows = windows
             self.windows_updated.emit(windows)
+
+    def _report_session_lost(self) -> None:
+        """Mark the session lost, unless it was closed deliberately meanwhile.
+
+        Heartbeat pings run on short-lived daemon threads with a 10s timeout,
+        so one can still be in flight when the user disconnects. Without this
+        guard the late reply flips a cleanly-closed session to "Session lost"
+        and the UI sticks there.
+        """
+        if self._disconnect_requested or not self._session_id:
+            logger.debug("Ignoring heartbeat failure: session was closed deliberately.")
+            return
+        self._set_state(SessionState.LOST)
 
     def _set_state(self, state: SessionState) -> None:
         if self.state != state:

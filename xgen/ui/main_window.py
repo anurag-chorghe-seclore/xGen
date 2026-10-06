@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sys
 from typing import Optional
-from PyQt6.QtCore import Qt, QPoint, QTimer, QEvent, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QEvent, QObject, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QCursor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -253,6 +253,10 @@ class MainWindow(QMainWindow):
 
         # Global OS-Level Keyboard Shortcuts (F3, F4, Esc, Ctrl+R work everywhere)
         self.key_hook.f3_pressed.connect(self.inspect_mode.toggle)
+        # Re-snapshot the Qt-owned values the hover filter needs before the
+        # pynput threads start consulting them (mode_changed is emitted on the
+        # GUI thread by InspectMode.activate/deactivate).
+        self.inspect_mode.mode_changed.connect(lambda _active: self.refresh_hover_filter_snapshot())
         self.key_hook.f4_pressed.connect(self._on_f4_freeze_shortcut)
         self.key_hook.esc_pressed.connect(self.inspect_mode.deactivate)
         self.key_hook.ctrl_r_pressed.connect(self._on_refresh_requested)
@@ -569,6 +573,10 @@ class MainWindow(QMainWindow):
 
     def _on_session_started(self, info) -> None:
         self.status_bar.lbl_msg.setText(f"Connected to {info.app_name}. Fetching initial UI tree...")
+        # The driver on the other end is only known once the session exists, and
+        # it decides which selector controls are meaningful (see
+        # XPathPanel.apply_driver_dialect).
+        self.xpath_panel.apply_driver_dialect()
         target_handle = info.active_handle or self.config.app_top_level_window
         self._refresh_window_picker(selected_handle=target_handle)
         # Auto-fetch tree on session connect (force new fetch)
@@ -1185,12 +1193,82 @@ class MainWindow(QMainWindow):
         txt_xpath.setFocus()
         dlg.show()
 
+    def moveEvent(self, event: object) -> None:
+        # Keeps the hover filter's cached window rect honest; without this,
+        # moving xGen during Inspect Mode would leave the filter testing
+        # against the old position.
+        self.refresh_hover_filter_snapshot()
+        super().moveEvent(event)
+
+    def resizeEvent(self, event: object) -> None:
+        self.refresh_hover_filter_snapshot()
+        super().resizeEvent(event)
+
+    def showEvent(self, event: object) -> None:
+        self.refresh_hover_filter_snapshot()
+        super().showEvent(event)
+
     def changeEvent(self, event: object) -> None:
         """Auto-deactivate inspect mode when xGen is minimized."""
         if isinstance(event, QEvent) and event.type() == QEvent.Type.WindowStateChange:
             if self.isMinimized() and self.inspect_mode.is_active:
                 self.inspect_mode.deactivate()
         super().changeEvent(event)
+
+    def refresh_hover_filter_snapshot(self) -> None:
+        """
+        Cache the Qt-owned values _is_point_outside_xgen needs, on the GUI thread.
+
+        That filter is called from pynput's listener thread for every mouse
+        event while Inspect Mode is active (see capture/mouse_hook.py). Reading
+        widget geometry, winId() or QScreen from a non-GUI thread is undefined
+        in Qt, and winId() can *create* a native handle — which on macOS means
+        touching AppKit off the main thread, something AppKit does not allow.
+        So the filter reads this plain-data snapshot instead of live Qt objects.
+
+        Refreshed whenever the window moves or resizes, and when Inspect Mode
+        starts, which covers everything that can invalidate it.
+        """
+        try:
+            geom = self.frameGeometry()
+            self._hover_frame_rect = (geom.left(), geom.top(), geom.right(), geom.bottom())
+        except Exception:
+            pass
+
+        try:
+            self._hover_overlay_id = get_platform_backend().native_window_id_for_widget(self.overlay)
+        except Exception:
+            self._hover_overlay_id = None
+
+        screens = []
+        try:
+            app = QApplication.instance()
+            for s in (app.screens() if app else []):
+                dpr = float(s.devicePixelRatio()) or 1.0
+                g = s.geometry()
+                a = s.availableGeometry()
+                screens.append({
+                    "dpr": dpr,
+                    "phys": (int(g.x() * dpr), int(g.y() * dpr),
+                             int(g.x() * dpr) + int(g.width() * dpr),
+                             int(g.y() * dpr) + int(g.height() * dpr)),
+                    "logical": (g.left(), g.top(), g.right(), g.bottom()),
+                    "avail": (a.left(), a.top(), a.right(), a.bottom()),
+                })
+        except Exception:
+            pass
+        self._hover_screens = screens
+
+    def _snapshot_dpr_at(self, x: int, y: int) -> float:
+        """Scale factor for a native point, resolved from the cached screen list."""
+        if not get_platform_backend().uses_physical_pixel_coords():
+            return 1.0
+        for s in getattr(self, "_hover_screens", []) or []:
+            pl, pt, pr, pb = s["phys"]
+            ll, lt, lr, lb = s["logical"]
+            if (pl <= x < pr and pt <= y < pb) or (ll <= x < lr and lt <= y < lb):
+                return s["dpr"]
+        return 1.0
 
     def _is_point_outside_xgen(self, screen_x: int, screen_y: int) -> bool:
         """
@@ -1216,10 +1294,9 @@ class MainWindow(QMainWindow):
                 # two matched nothing — the overlay then looked like "some
                 # other xGen window", hover was suppressed, the overlay hid,
                 # and the next tick showed it again: a visible 10Hz blink.
-                try:
-                    overlay_hwnd = backend.native_window_id_for_widget(self.overlay)
-                except Exception:
-                    overlay_hwnd = None
+                # From the cached snapshot: this runs on pynput's thread, where
+                # winId() must not be called (see refresh_hover_filter_snapshot).
+                overlay_hwnd = getattr(self, "_hover_overlay_id", None)
 
                 if overlay_hwnd is None:
                     # Backend can't identify its own windows. Skip the own-PID
@@ -1234,26 +1311,39 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # 2. Check if click is inside xGen's own window geometry
-        dpr = get_screen_dpr_at(screen_x, screen_y)
+        # 2. Check if click is inside xGen's own window geometry.
+        # Both the scale factor and the window rect come from the snapshot
+        # rather than from live Qt objects, because this may be running on
+        # pynput's listener thread.
+        dpr = self._snapshot_dpr_at(screen_x, screen_y)
         lx = int(screen_x / dpr) if dpr > 0 else screen_x
         ly = int(screen_y / dpr) if dpr > 0 else screen_y
 
-        geom = self.frameGeometry()
-        is_inside = (geom.left() <= lx <= geom.right() and geom.top() <= ly <= geom.bottom()) or \
-                    (geom.left() <= screen_x <= geom.right() and geom.top() <= screen_y <= geom.bottom())
-        if is_inside:
+        frame = getattr(self, "_hover_frame_rect", None)
+        if frame is None:
+            self.refresh_hover_filter_snapshot()
+            frame = getattr(self, "_hover_frame_rect", None)
+        # Compare in Qt's logical coordinate space only. There used to be a
+        # second clause testing the *unscaled* cursor position against the same
+        # logical rect as a belt-and-braces fallback, but the two spaces differ
+        # by the display's scale factor, so on any scaled display (every Retina
+        # Mac, and Windows above 100%) it marked a phantom "inside xGen" region
+        # at a fraction of the window's coordinates. Hover was suppressed there
+        # even though the cursor was nowhere near xGen — and the dead zone moved
+        # with the window, so relocating xGen moved the problem instead of
+        # fixing it. At 100% scale the two clauses were identical, which is why
+        # it went unnoticed on Windows.
+        if frame is not None and frame[0] <= lx <= frame[2] and frame[1] <= ly <= frame[3]:
             return False
 
-        # 3. Check if click is on the Windows Taskbar / System Tray
-        app = QApplication.instance()
-        if app:
-            screen = app.screenAt(QPoint(lx, ly)) or app.primaryScreen()
-            if screen:
-                avail = screen.availableGeometry()
-                # If coordinate is outside available work area (e.g. on Taskbar), NEVER suppress clicks!
-                if not (avail.left() <= lx <= avail.right() and avail.top() <= ly <= avail.bottom()):
-                    return False
+        # 3. Never suppress clicks outside the usable work area — the Windows
+        # taskbar / system tray, or the macOS menu bar and Dock. Also read from
+        # the snapshot, for the same thread-safety reason as above.
+        avail_rects = getattr(self, "_hover_screens", None)
+        if avail_rects:
+            if not any(a[0] <= lx <= a[2] and a[1] <= ly <= a[3]
+                       for a in (s["avail"] for s in avail_rects)):
+                return False
 
         return True
 

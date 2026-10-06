@@ -12,7 +12,7 @@ from PyQt6.QtGui import QColor, QPaintEvent, QPainter, QPen
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from xgen.platform.factory import get_platform_backend
-from xgen.utils.dpi import physical_to_logical_rect
+from xgen.utils.dpi import get_screen_dpr_at, physical_to_logical_rect
 from xgen.utils.rect import Rect
 
 logger = logging.getLogger("xgen.overlay")
@@ -99,21 +99,32 @@ class OverlayWindow(QWidget):
         self.update()
 
     def _is_fullscreen_rect(self, rect: Rect) -> bool:
-        """Check if bounding rect covers the entire monitor screen."""
+        """Check if bounding rect covers the entire monitor screen.
+
+        `rect` is in the platform's *native* coordinate space, which is not the
+        same thing everywhere: physical pixels on Windows, points on macOS.
+        get_screen_dpr_at() is the single place that knows which, so the
+        screen's logical geometry is scaled into the rect's own space through
+        it. Hardcoding devicePixelRatio here instead made this test silently
+        dead on every Retina Mac — the screen looked twice as large as any
+        rect could be, so desktop-sized elements stopped being suppressed and
+        flooded the display with a full-screen highlight.
+        """
         app = QApplication.instance()
         if not app:
             return False
         cx = rect.left + rect.width // 2
         cy = rect.top + rect.height // 2
-        screen = app.screenAt(QPoint(cx, cy)) or app.primaryScreen()
+        dpr = get_screen_dpr_at(cx, cy) or 1.0
+        # screenAt() wants logical coordinates; cx/cy are native.
+        screen = app.screenAt(QPoint(int(cx / dpr), int(cy / dpr))) or app.primaryScreen()
         if screen:
             geom = screen.geometry()
-            dpr = screen.devicePixelRatio() or 1.0
-            phys_w = int(geom.width() * dpr)
-            phys_h = int(geom.height() * dpr)
+            nat_w = int(geom.width() * dpr)
+            nat_h = int(geom.height() * dpr)
             # If rect spans the whole monitor from corner to corner
             if abs(rect.left - int(geom.left() * dpr)) <= 10 and abs(rect.top - int(geom.top() * dpr)) <= 10:
-                if rect.width >= (phys_w - 40) and rect.height >= (phys_h - 40):
+                if rect.width >= (nat_w - 40) and rect.height >= (nat_h - 40):
                     return True
         return False
 

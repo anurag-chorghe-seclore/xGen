@@ -111,3 +111,6 @@ class UnsupportedBackend:
         # No native backend here, but a user on Linux can still point xGen at
         # a remote Appium server; Windows stays the historical default.
         return "windows"
+
+    def uses_physical_pixel_coords(self) -> bool:
+        return True

@@ -51,6 +51,7 @@ call site keeps working unmodified. See _to_pseudo_physical()/_to_ax_points().
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from collections import deque
 from typing import List, Optional, Tuple
@@ -158,6 +159,16 @@ class MacBackend:
     def __init__(self) -> None:
         # Widgets whose NSWindow level has already been raised; see enforce_topmost.
         self._topmost_applied: set = set()
+        # {id(widget): CGWindowID} for every window apply_click_through() has
+        # made transparent to input. Recorded on the GUI thread at the moment
+        # the window is shown, because window_from_point() runs on pynput's
+        # listener thread, where touching AppKit is not allowed. See
+        # _click_through_window_ids().
+        self._click_through_ids: dict = {}
+
+    def _click_through_window_ids(self) -> set:
+        """CGWindowIDs of our own click-through windows, for hit-tests to skip."""
+        return set(self._click_through_ids.values())
 
     # ------------------------------------------------------------------
     # Accessibility
@@ -263,7 +274,7 @@ class MacBackend:
             box = cls._ax_point_size(element)
             if box:
                 left, top, width, height = box
-                bounding_rect = _PSEUDO_PHYSICAL.rect_from_points(left, top, width, height)
+                bounding_rect = _rect_from_points(left, top, width, height)
 
             return NativeElement(
                 runtime_id="",  # AX has no UIA-RuntimeId equivalent; see module docstring / design note.
@@ -280,15 +291,55 @@ class MacBackend:
             logger.debug("Error converting AX element to NativeElement: %s", e)
             return None
 
+    @staticmethod
+    def _pid_for_element(element: object) -> Optional[int]:
+        """Owning process of an AXUIElement, or None if it can't be determined."""
+        if not HAS_AX or element is None:
+            return None
+        try:
+            err, pid = AXFW.AXUIElementGetPid(element, None)
+            if err != 0:
+                return None
+            return int(pid)
+        except Exception:
+            return None
+
+    def _foreign_app_element_at(self, x: float, y: float) -> object:
+        """Application AXUIElement of the topmost window at a point that isn't ours."""
+        if not HAS_AX:
+            return None
+        own_pid = os.getpid()
+        try:
+            for info in self._windows_at_point(x, y):
+                pid = int(info.get("kCGWindowOwnerPID", 0) or 0)
+                if not pid or pid == own_pid:
+                    continue
+                return AXFW.AXUIElementCreateApplication(pid)
+        except Exception as e:
+            logger.debug("Could not resolve a foreign app element at (%s, %s): %s", x, y, e)
+        return None
+
     def element_from_point(self, x: int, y: int) -> Optional[NativeElement]:
         if not HAS_AX:
             return None
         try:
-            ax_x, ax_y = _PSEUDO_PHYSICAL.to_points(x, y)
+            ax_x, ax_y = float(x), float(y)
             system_wide = AXFW.AXUIElementCreateSystemWide()
             err, element = AXFW.AXUIElementCopyElementAtPosition(system_wide, ax_x, ax_y, None)
             if err != 0 or element is None:
                 return None
+
+            # The highlight overlay sits at the maximum window level, right
+            # under the cursor, and the accessibility hit-test honours window
+            # order rather than setIgnoresMouseEvents_ — so without this the
+            # system-wide hit-test keeps returning xGen's own overlay instead
+            # of the element it is drawn around. Re-enter through the topmost
+            # window at that point that belongs to another process.
+            if self._pid_for_element(element) == os.getpid():
+                element = self._foreign_app_element_at(ax_x, ax_y)
+                if element is None:
+                    return None
+
             best = self._drill_down(element, ax_x, ax_y)
             return self._element_to_native(best)
         except Exception as e:
@@ -324,7 +375,7 @@ class MacBackend:
                 message="xGen needs Accessibility permission (System Settings > Privacy & Security > Accessibility).",
             )
         try:
-            ax_x, ax_y = _PSEUDO_PHYSICAL.to_points(cursor_x, cursor_y)
+            ax_x, ax_y = float(cursor_x), float(cursor_y)
             system_wide = AXFW.AXUIElementCreateSystemWide()
             err, element = AXFW.AXUIElementCopyElementAtPosition(system_wide, ax_x, ax_y, None)
             if err != 0 or element is None:
@@ -427,7 +478,7 @@ class MacBackend:
         kCGWindowOwnerName, which needs no permission — only per-window titles
         are lost, and those aren't what a Mac session targets anyway.
         """
-        own_pid = __import__("os").getpid()
+        own_pid = os.getpid()
         found: List[WindowTarget] = []
         seen_apps: set = set()
 
@@ -480,24 +531,38 @@ class MacBackend:
         except Exception:
             return ""
 
+    def _windows_at_point(self, x: float, y: float) -> List[dict]:
+        """Our own click-through windows excluded, front-to-back, at a point.
+
+        CGWindowListCopyWindowInfo with kCGWindowListOptionOnScreenOnly returns
+        windows topmost-first, so callers can take the first entry.
+        """
+        if not HAS_QUARTZ:
+            return []
+        skip = self._click_through_window_ids()
+        options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+        window_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []
+        hits: List[dict] = []
+        for info in window_list:
+            if int(info.get("kCGWindowNumber", 0)) in skip:
+                continue
+            bounds = info.get("kCGWindowBounds") or {}
+            left = bounds.get("X", 0)
+            top = bounds.get("Y", 0)
+            width = bounds.get("Width", 0)
+            height = bounds.get("Height", 0)
+            if left <= x <= left + width and top <= y <= top + height:
+                hits.append(info)
+        return hits
+
     def window_from_point(self, x: int, y: int) -> Optional[int]:
         if not HAS_QUARTZ:
             return None
         try:
-            ax_x, ax_y = _PSEUDO_PHYSICAL.to_points(x, y)
-            options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
-            window_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []
-            # CGWindowListCopyWindowInfo with this option set returns windows
-            # front-to-back (topmost first), so the first bounds match wins.
-            for info in window_list:
-                bounds = info.get("kCGWindowBounds") or {}
-                left = bounds.get("X", 0)
-                top = bounds.get("Y", 0)
-                width = bounds.get("Width", 0)
-                height = bounds.get("Height", 0)
-                if left <= ax_x <= left + width and top <= ax_y <= top + height:
-                    return int(info.get("kCGWindowNumber", 0))
-            return None
+            hits = self._windows_at_point(float(x), float(y))
+            if not hits:
+                return None
+            return int(hits[0].get("kCGWindowNumber", 0))
         except Exception:
             return None
 
@@ -546,7 +611,21 @@ class MacBackend:
             return None
 
     def apply_click_through(self, widget: object) -> None:
-        """Make the overlay's NSWindow ignore mouse events, so clicks pass through to whatever's underneath."""
+        """Make the overlay's NSWindow ignore mouse events, so clicks pass through to whatever's underneath.
+
+        Also records the window's CGWindowID so window_from_point() can skip
+        it. setIgnoresMouseEvents_ only governs *event routing*: the window
+        server's geometric hit-test still reports the window, and so does the
+        accessibility hit-test. Since the highlight overlay sits at the maximum
+        window level directly under the cursor, every unguarded hit-test lands
+        on it rather than the element it is drawing around.
+
+        Re-recorded on every call rather than once, because Qt can destroy and
+        recreate the native NSWindow across a hide/show cycle, which changes
+        the window number. A cached id that has gone stale is what makes the
+        highlight blink: the filter stops recognising the overlay as its own,
+        suppresses hover, hides the overlay, and the next tick shows it again.
+        """
         ns_window = self._ns_window_for_widget(widget)
         if ns_window is None:
             return
@@ -554,6 +633,10 @@ class MacBackend:
             ns_window.setIgnoresMouseEvents_(True)
         except Exception as e:
             logger.debug("Could not apply native click-through: %s", e)
+        try:
+            self._click_through_ids[id(widget)] = int(ns_window.windowNumber())
+        except Exception as e:
+            logger.debug("Could not record click-through window id: %s", e)
 
     def enforce_topmost(self, widget: object) -> None:
         """Raise the overlay's NSWindow above other windows, including context menus.
@@ -615,7 +698,7 @@ class MacBackend:
         if HAS_QUARTZ:
             try:
                 loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-                return _PSEUDO_PHYSICAL.to_pseudo_physical(float(loc.x), float(loc.y))
+                return int(round(loc.x)), int(round(loc.y))
             except Exception:
                 pass
         # Fall through to the same Qt-based fallback WindowsBackend uses when the native call fails.
@@ -695,6 +778,12 @@ class MacBackend:
     def default_driver_platform(self) -> str:
         return "mac"
 
+    def uses_physical_pixel_coords(self) -> bool:
+        # macOS reports points, not pixels, through both the accessibility API
+        # and Appium's Mac2 driver — the same space Qt uses for geometry. No
+        # scale conversion belongs anywhere in this backend's coordinates.
+        return False
+
     # ------------------------------------------------------------------
     # Input suppression (see backend.py's PlatformBackend docstring for why
     # this exists — it lets capture/mouse_hook.py plug macOS's native click
@@ -715,46 +804,41 @@ class MacBackend:
             else:
                 return None
             loc = Quartz.CGEventGetLocation(native_event)
-            x, y = _PSEUDO_PHYSICAL.to_pseudo_physical(float(loc.x), float(loc.y))
+            x, y = int(round(loc.x)), int(round(loc.y))
             return (x, y, is_press)
         except Exception:
             return None
 
 
 # ----------------------------------------------------------------------
-# Coordinate-space normalization (see module docstring)
+# Coordinate space — points, all the way through
 # ----------------------------------------------------------------------
-
-class _PseudoPhysicalCoords:
-    """
-    Converts between native AX "points" and the "pseudo-physical" pixel
-    convention the rest of xGen's pipeline expects (see module docstring).
-    A tiny stateless helper, not a MacBackend method, so it can be unit
-    tested without any PyObjC import succeeding.
-    """
-
-    @staticmethod
-    def to_pseudo_physical(x_pts: float, y_pts: float) -> Tuple[int, int]:
-        dpr = MacBackend._backing_scale_factor_at(x_pts, y_pts)
-        return int(round(x_pts * dpr)), int(round(y_pts * dpr))
-
-    @staticmethod
-    def to_points(x_phys: int, y_phys: int) -> Tuple[float, float]:
-        # Scale factor is looked up at the *physical* point first using a 1.0
-        # guess, then refined — in practice screens are rarely mixed-DPI at
-        # adjacent pixels, so a single pass (assume 1.0, look up, rescale) is
-        # accurate enough; exact only matters at display-boundary pixels.
-        dpr = MacBackend._backing_scale_factor_at(x_phys, y_phys)
-        return x_phys / dpr, y_phys / dpr
-
-    @staticmethod
-    def rect_from_points(left: float, top: float, width: float, height: float) -> Rect:
-        dpr = MacBackend._backing_scale_factor_at(left, top)
-        l = int(round(left * dpr))
-        t = int(round(top * dpr))
-        w = int(round(width * dpr))
-        h = int(round(height * dpr))
-        return Rect(left=l, top=t, right=l + w, bottom=t + h)
+#
+# An earlier version of this backend multiplied every AX coordinate by the
+# display's backing scale factor, to manufacture the "physical pixels"
+# convention WindowsBackend naturally has, so that the existing
+# physical->logical conversion in xgen/utils/dpi.py would keep working
+# untouched. That reasoning only held while the native accessibility API was
+# the single source of coordinates.
+#
+# It stopped holding the moment Appium's Mac2 driver joined: its element rects
+# are in **points**, and nothing scales them. So the scaled AX values and the
+# unscaled driver values sat exactly one scale factor apart, and on a Retina
+# display ElementBridge compared numbers from two different spaces — every
+# bounding-rect and point-containment match silently failed and fell through
+# to the low-confidence synthetic fallback, while highlights derived from tree
+# rects drew at half size. Nothing raised an error; it simply stopped
+# recognising elements.
+#
+# macOS reports points from both sources, and points are the same space Qt
+# uses for widget geometry — so the correct answer is to convert nowhere.
+# uses_physical_pixel_coords() returns False here, which makes
+# dpi.get_screen_dpr_at() report 1.0 on this platform and turns every
+# conversion in the pipeline into the identity it should be.
 
 
-_PSEUDO_PHYSICAL = _PseudoPhysicalCoords()
+def _rect_from_points(left: float, top: float, width: float, height: float) -> Rect:
+    """Build a Rect from AX point values, with no scale conversion (see above)."""
+    l = int(round(left))
+    t = int(round(top))
+    return Rect(left=l, top=t, right=l + int(round(width)), bottom=t + int(round(height)))

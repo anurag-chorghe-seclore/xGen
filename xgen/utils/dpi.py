@@ -32,7 +32,24 @@ def get_physical_cursor_pos() -> tuple[int, int]:
 
 
 def get_screen_dpr_at(x: int, y: int) -> float:
-    """Return the device pixel ratio (scaling factor e.g. 1.0, 1.25, 1.5, 2.0) for the screen at (x, y)."""
+    """
+    Return the factor for converting this platform's native screen coordinates
+    into Qt's logical space — 1.0 when no conversion is needed.
+
+    Every physical->logical conversion in xGen funnels through here, so this is
+    the single place that decides whether scaling happens at all. On Windows
+    native coordinates are physical pixels and the display's device pixel ratio
+    applies. On macOS the accessibility API and Appium's Mac2 driver both report
+    points, which is already Qt's space, so converting would put the three
+    coordinate sources out of step with each other by exactly the scale factor.
+    """
+    from xgen.platform.factory import get_platform_backend
+    try:
+        if not get_platform_backend().uses_physical_pixel_coords():
+            return 1.0
+    except Exception:
+        pass  # fall through to the measured ratio
+
     app = QApplication.instance()
     if not app:
         return 1.0

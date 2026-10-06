@@ -2,6 +2,8 @@
 Unit tests for TransientCapturer (F4 snapshot, timed capture, freeze mode).
 """
 
+import sys
+
 import pytest
 from PyQt6.QtWidgets import QApplication
 from xgen.capture.transient_capture import TransientCapturer
@@ -54,6 +56,10 @@ def test_uia_list_to_tree_conversion(qapp):
     assert tree_root.children[1].automation_id == "item_paste"
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="monkeypatches the real uiautomation module, which only installs on Windows",
+)
 def test_freeze_snapshot_no_control_emits_failure(qapp, monkeypatch):
     capturer = TransientCapturer()
     import uiautomation as auto
@@ -67,6 +73,10 @@ def test_freeze_snapshot_no_control_emits_failure(qapp, monkeypatch):
     assert "No control found" in failed_reasons[0]
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="monkeypatches the real uiautomation module, which only installs on Windows",
+)
 def test_freeze_snapshot_desktop_emits_failure(qapp, monkeypatch):
     capturer = TransientCapturer()
     import uiautomation as auto

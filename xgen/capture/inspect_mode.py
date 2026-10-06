@@ -31,6 +31,10 @@ class InspectMode(QObject):
     hovering = pyqtSignal(object)             # UIAElement
     element_clicked = pyqtSignal(object, int, int)  # UIAElement, click_x, click_y
 
+    # How many consecutive empty hover resolutions it takes to drop the
+    # highlight. See _empty_ticks in __init__.
+    EMPTY_TICKS_BEFORE_HIDE = 2
+
     def __init__(
         self,
         config: XGenConfig,
@@ -46,6 +50,12 @@ class InspectMode(QObject):
         self._is_active = False
         self._last_uia_el: Optional[UIAElement] = None
         self._window_filter: Optional[Callable[[int, int], bool]] = None
+        # Consecutive polls that resolved to nothing. The highlight is only
+        # dropped once this passes EMPTY_TICKS_BEFORE_HIDE, so a single
+        # unlucky hit-test — a window animating, a menu opening, the target
+        # app briefly busy — dims the box for one frame instead of making it
+        # blink at the poll rate. Reset the moment anything resolves.
+        self._empty_ticks = 0
 
         # Hover polling timer
         self._poll_timer = QTimer(self)
@@ -79,6 +89,7 @@ class InspectMode(QObject):
         logger.info("Entering Inspect Mode (F3).")
         self._is_active = True
         self._last_uia_el = None
+        self._empty_ticks = 0
 
         # Set crosshair cursor application-wide
         QApplication.setOverrideCursor(QCursor(Qt.CursorShape.CrossCursor))
@@ -120,7 +131,7 @@ class InspectMode(QObject):
             # Preserve test-verified green box and selected blue box while cursor is inside xGen window
             if self.overlay.style_mode in ("tested", "selected"):
                 return
-            self.overlay.hide_overlay()
+            self._hide_after_empty_tick()
             return
 
         # 1. Check active cached XML tree for exact innermost leaf control
@@ -143,15 +154,23 @@ class InspectMode(QObject):
                     bounding_rect=deepest_node.bounding_rect
                 )
                 self._last_uia_el = leaf_el
+                self._empty_ticks = 0
                 self.overlay.highlight_hover(deepest_node.bounding_rect)
                 self.hovering.emit(leaf_el)
                 return
 
         if el is not None:
             self._last_uia_el = el
+            self._empty_ticks = 0
             self.overlay.highlight_hover(el.bounding_rect)
             self.hovering.emit(el)
         else:
+            self._hide_after_empty_tick()
+
+    def _hide_after_empty_tick(self) -> None:
+        """Drop the highlight only once several polls in a row resolve to nothing."""
+        self._empty_ticks += 1
+        if self._empty_ticks >= self.EMPTY_TICKS_BEFORE_HIDE:
             self.overlay.hide_overlay()
 
     def _on_mouse_click(self, x: int, y: int) -> None:

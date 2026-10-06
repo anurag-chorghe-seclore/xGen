@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from xgen.core.driver_dialect import active_dialect
 from xgen.core.tree_cache import TreeCacheStore
 from xgen.core.tree_parser import UINode
 from xgen.core.xpath_generator import XPathCandidate, XPathGenerator, XPathTier
@@ -424,6 +425,7 @@ class XPathPanel(QWidget):
         )
         self.chk_prefix.toggled.connect(self._on_prefix_toggled)
         header_row.addWidget(self.chk_prefix)
+        self.apply_driver_dialect()
         main_layout.addLayout(header_row)
 
         # 2. Scroll Area containing candidate cards
@@ -530,3 +532,19 @@ class XPathPanel(QWidget):
     def _on_prefix_toggled(self) -> None:
         if self._current_node:
             self.populate(self._current_node, self._tree_root, self._lxml_tree)
+
+    def apply_driver_dialect(self) -> None:
+        """Show the //Window prefix toggle only for drivers it means something for.
+
+        Driven by the active session's dialect rather than by sys.platform:
+        xGen running on Windows can drive a remote Mac Appium server, and it
+        is the driver on the other end that decides whether a window container
+        is a useful anchor. See DriverDialect.supports_window_prefix.
+        """
+        dialect = active_dialect()
+        supported = getattr(dialect, "supports_window_prefix", True)
+        self.chk_prefix.setVisible(supported)
+        if not supported and self.chk_prefix.isChecked():
+            # Clear it rather than leave a hidden control silently padding
+            # every generated selector with a prefix that anchors nothing.
+            self.chk_prefix.setChecked(False)

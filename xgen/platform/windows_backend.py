@@ -444,9 +444,13 @@ class WindowsBackend:
         if not HAS_WIN32_WINDOW_APIS:
             return None
         try:
-            return win32gui.WindowFromPoint((x, y))
+            hwnd = win32gui.WindowFromPoint((x, y))
         except Exception:
             return None
+        # Never report one of our own click-through overlays (see apply_click_through).
+        if hwnd and hwnd in self._click_through_window_ids():
+            return None
+        return hwnd
 
     def get_process_id_for_window(self, hwnd: int) -> Optional[int]:
         if not HAS_WIN32_WINDOW_APIS or not hwnd:
@@ -476,8 +480,26 @@ class WindowsBackend:
     _SWP_NOACTIVATE = 0x0010
     _SWP_SHOWWINDOW = 0x0040
 
+    def _click_through_window_ids(self) -> set:
+        """HWNDs of our own click-through windows, for hit-tests to skip."""
+        return set(getattr(self, "_click_through_ids", {}).values())
+
     def apply_click_through(self, widget: object) -> None:
-        """Apply Win32 WS_EX_TRANSPARENT safely without disrupting Qt alpha compositing."""
+        """Apply Win32 WS_EX_TRANSPARENT safely without disrupting Qt alpha compositing.
+
+        Also records the HWND so window_from_point() can skip it. WS_EX_TRANSPARENT
+        makes the window transparent to *input*, but the highlight overlay is
+        drawn directly under the cursor, so any hit-test that still reports it
+        makes the hover filter mistake the overlay for "some other xGen window"
+        and suppress hover — which hides the overlay, so the next tick shows it
+        again: a visible blink at the poll rate. Mirrors MacBackend.
+        """
+        if not hasattr(self, "_click_through_ids"):
+            self._click_through_ids: dict = {}
+        try:
+            self._click_through_ids[id(widget)] = int(widget.winId())  # type: ignore[attr-defined]
+        except Exception as e:
+            logger.debug("Could not record click-through window id: %s", e)
         try:
             hwnd = ctypes.wintypes.HWND(int(widget.winId()))  # type: ignore[attr-defined]
             user32 = ctypes.windll.user32
@@ -645,3 +667,6 @@ class WindowsBackend:
 
     def default_driver_platform(self) -> str:
         return "windows"
+
+    def uses_physical_pixel_coords(self) -> bool:
+        return True
