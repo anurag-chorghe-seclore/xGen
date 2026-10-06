@@ -143,12 +143,13 @@ class XPathGenerator:
         if include_window_prefix:
             candidates = [self._prepend_window_container(c, node) for c in candidates]
 
-        # Normalize formatting and validate Appium compatibility
+        # Normalize formatting and validate compatibility with the target driver's XPath engine
+        dialect = node.driver_dialect
         valid_candidates: List[XPathCandidate] = []
         seen_xpaths = set()
         for c in candidates:
             norm_xpath = AppiumXPathCompatLayer.normalize_readability(c.xpath)
-            if norm_xpath and AppiumXPathCompatLayer.is_appium_compatible(norm_xpath):
+            if norm_xpath and AppiumXPathCompatLayer.is_appium_compatible(norm_xpath, dialect):
                 c.xpath = norm_xpath
                 if c.xpath not in seen_xpaths:
                     seen_xpaths.add(c.xpath)
@@ -172,26 +173,28 @@ class XPathGenerator:
     # --- Strategy Generators ---
 
     def _tier1(self, node: UINode) -> Optional[XPathCandidate]:
+        attr_id = node.driver_dialect.attr_automation_id
         auto_id = node.automation_id
-        if auto_id:
+        if auto_id and attr_id:
             verdict = VolatilityClassifier.classify_id_volatility(auto_id)
             if verdict != VolatilityVerdict.VOLATILE:
                 val = escape_xpath_literal(auto_id)
                 return XPathCandidate(
-                    xpath=f"//*[@AutomationId={val}]",
+                    xpath=f"//*[@{attr_id}={val}]",
                     tier=XPathTier.T6_AUTO_ID
                 )
         return None
 
     def _tier2(self, node: UINode) -> Optional[XPathCandidate]:
+        attr_id = node.driver_dialect.attr_automation_id
         auto_id = node.automation_id
         tag = node.tag
-        if auto_id and tag:
+        if auto_id and tag and attr_id:
             verdict = VolatilityClassifier.classify_id_volatility(auto_id)
             if verdict != VolatilityVerdict.VOLATILE:
                 val = escape_xpath_literal(auto_id)
                 return XPathCandidate(
-                    xpath=f"//{tag}[@AutomationId={val}]",
+                    xpath=f"//{tag}[@{attr_id}={val}]",
                     tier=XPathTier.T5_TYPE_AUTO_ID
                 )
         return None
@@ -201,10 +204,11 @@ class XPathGenerator:
         name = node.name
         if not name:
             return results
+        attr_name = node.name_attr
 
         val_name = escape_xpath_literal(name)
         results.append(XPathCandidate(
-            xpath=f"//*[@Name={val_name}]",
+            xpath=f"//*[@{attr_name}={val_name}]",
             tier=XPathTier.T2_NAME,
             localization_risk=True
         ))
@@ -215,13 +219,13 @@ class XPathGenerator:
             val_sub = escape_xpath_literal(stable_sub)
             if name.startswith(stable_sub):
                 results.append(XPathCandidate(
-                    xpath=f"//*[starts-with(@Name, {val_sub})]",
+                    xpath=f"//*[starts-with(@{attr_name}, {val_sub})]",
                     tier=XPathTier.T2A_NAME_STARTS_WITH,
                     localization_risk=True
                 ))
             else:
                 results.append(XPathCandidate(
-                    xpath=f"//*[contains(@Name, {val_sub})]",
+                    xpath=f"//*[contains(@{attr_name}, {val_sub})]",
                     tier=XPathTier.T2B_NAME_CONTAINS,
                     localization_risk=True
                 ))
@@ -234,10 +238,11 @@ class XPathGenerator:
         tag = node.tag
         if not name or not tag:
             return results
+        attr_name = node.name_attr
 
         val_name = escape_xpath_literal(name)
         results.append(XPathCandidate(
-            xpath=f"//{tag}[@Name={val_name}]",
+            xpath=f"//{tag}[@{attr_name}={val_name}]",
             tier=XPathTier.T1_TYPE_NAME,
             localization_risk=True
         ))
@@ -247,13 +252,13 @@ class XPathGenerator:
             val_sub = escape_xpath_literal(stable_sub)
             if name.startswith(stable_sub):
                 results.append(XPathCandidate(
-                    xpath=f"//{tag}[starts-with(@Name, {val_sub})]",
+                    xpath=f"//{tag}[starts-with(@{attr_name}, {val_sub})]",
                     tier=XPathTier.T1A_TYPE_NAME_STARTS_WITH,
                     localization_risk=True
                 ))
             else:
                 results.append(XPathCandidate(
-                    xpath=f"//{tag}[contains(@Name, {val_sub})]",
+                    xpath=f"//{tag}[contains(@{attr_name}, {val_sub})]",
                     tier=XPathTier.T1B_TYPE_NAME_CONTAINS,
                     localization_risk=True
                 ))
@@ -261,15 +266,16 @@ class XPathGenerator:
         return results
 
     def _tier_helptext_fallback(self, node: UINode) -> List[XPathCandidate]:
-        """Generate HelpText-based selectors when Name is absent."""
+        """Generate HelpText-based selectors when Name is absent (drivers that have one)."""
         results: List[XPathCandidate] = []
+        attr_help = node.driver_dialect.attr_help_text
         help_text = node.help_text
-        if not help_text or node.name or not node.tag:
+        if not attr_help or not help_text or node.name or not node.tag:
             return results
 
         val_help = escape_xpath_literal(help_text[:60])
         results.append(XPathCandidate(
-            xpath=f"//{node.tag}[@HelpText={val_help}]",
+            xpath=f"//{node.tag}[@{attr_help}={val_help}]",
             tier=XPathTier.T7_COMPOUND_ATTRS,
             localization_risk=True
         ))
@@ -278,6 +284,9 @@ class XPathGenerator:
     def _tier_classname_only(self, node: UINode) -> List[XPathCandidate]:
         """Generate class-based selectors for anonymous elements lacking Name/AutomationId."""
         results: List[XPathCandidate] = []
+        attr_cls = node.driver_dialect.attr_class_name
+        if not attr_cls:
+            return results  # e.g. Mac2, where the element type *is* the tag
         if node.name or node.automation_id or not node.class_name or not node.tag:
             return results
         if self.is_structurally_generic(node):
@@ -286,7 +295,7 @@ class XPathGenerator:
         cls_name = node.class_name
         val_cls = escape_xpath_literal(cls_name)
         results.append(XPathCandidate(
-            xpath=f"//{node.tag}[@ClassName={val_cls}]",
+            xpath=f"//{node.tag}[@{attr_cls}={val_cls}]",
             tier=XPathTier.T8_TYPE_NAME_CLASS
         ))
 
@@ -294,14 +303,18 @@ class XPathGenerator:
         for tok in tokens[:2]:
             val_tok = escape_xpath_literal(tok)
             results.append(XPathCandidate(
-                xpath=f"//{node.tag}[contains(@ClassName, {val_tok})]",
+                xpath=f"//{node.tag}[contains(@{attr_cls}, {val_tok})]",
                 tier=XPathTier.T8B_CLASS_TOKEN
             ))
         return results
 
     def _tier5_group(self, node: UINode) -> List[XPathCandidate]:
         results: List[XPathCandidate] = []
+        dialect = node.driver_dialect
+        attr_id = dialect.attr_automation_id
+        attr_cls = dialect.attr_class_name
         name = node.name
+        attr_name = node.name_attr
         tag = node.tag
         if not tag:
             return results
@@ -309,23 +322,26 @@ class XPathGenerator:
         cls_name = node.class_name
 
         # Compound: AutomationId + Name
-        if auto_id and name:
+        if auto_id and name and attr_id:
             verdict = VolatilityClassifier.classify_id_volatility(auto_id)
             if verdict != VolatilityVerdict.VOLATILE:
                 val_id = escape_xpath_literal(auto_id)
                 val_name = escape_xpath_literal(name)
                 results.append(XPathCandidate(
-                    xpath=f"//{tag}[@AutomationId={val_id} and @Name={val_name}]",
+                    xpath=f"//{tag}[@{attr_id}={val_id} and @{attr_name}={val_name}]",
                     tier=XPathTier.T7_COMPOUND_ATTRS,
                     localization_risk=True
                 ))
+
+        if not attr_cls:
+            return results  # driver has no ClassName equivalent (e.g. Mac2)
 
         # Compound: Name + ClassName
         if name and cls_name and not self.is_structurally_generic(node):
             val_name = escape_xpath_literal(name)
             val_cls = escape_xpath_literal(cls_name)
             results.append(XPathCandidate(
-                xpath=f"//{tag}[@Name={val_name} and @ClassName={val_cls}]",
+                xpath=f"//{tag}[@{attr_name}={val_name} and @{attr_cls}={val_cls}]",
                 tier=XPathTier.T8_TYPE_NAME_CLASS,
                 localization_risk=True
             ))
@@ -336,12 +352,12 @@ class XPathGenerator:
             for tok in tokens[:2]:
                 val_tok = escape_xpath_literal(tok)
                 results.append(XPathCandidate(
-                    xpath=f"//{tag}[contains(@ClassName, {val_tok})]",
+                    xpath=f"//{tag}[contains(@{attr_cls}, {val_tok})]",
                     tier=XPathTier.T8B_CLASS_TOKEN
                 ))
             val_cls = escape_xpath_literal(cls_name)
             results.append(XPathCandidate(
-                xpath=f"//{tag}[@ClassName={val_cls}]",
+                xpath=f"//{tag}[@{attr_cls}={val_cls}]",
                 tier=XPathTier.T8_TYPE_NAME_CLASS
             ))
 
@@ -353,14 +369,13 @@ class XPathGenerator:
         """
         if not anc:
             return False
-        if anc.class_name in self.KNOWN_GENERIC_CONTAINERS:
+        if anc.class_name and anc.class_name in self.KNOWN_GENERIC_CONTAINERS:
             return True
-        LAYOUT_ROLE_TAGS = {"Pane", "Group", "Custom", "Border", "Canvas", "View", "Panel"}
         if (
             not anc.name
             and not anc.automation_id
             and anc.child_count >= 1
-            and anc.tag in LAYOUT_ROLE_TAGS
+            and anc.tag in anc.driver_dialect.layout_tags
             and VolatilityClassifier.classify_id_volatility(anc.class_name or "") != VolatilityVerdict.STATIC
         ):
             return True
@@ -376,33 +391,38 @@ class XPathGenerator:
         if not ancestors:
             return results
 
+        dialect = node.driver_dialect
+        attr_id = dialect.attr_automation_id
+        attr_cls = dialect.attr_class_name
+        window_tag = dialect.window_tag
         tag = node.tag
         auto_id = node.automation_id
         name = node.name
+        attr_name = node.name_attr
         cls_name = node.class_name
 
         # Target child selector patterns
         child_patterns: List[str] = []
         if name:
             val_name = escape_xpath_literal(name)
-            child_patterns.append(f"//{tag}[@Name={val_name}]")
-        if auto_id and VolatilityClassifier.classify_id_volatility(auto_id) != VolatilityVerdict.VOLATILE:
+            child_patterns.append(f"//{tag}[@{attr_name}={val_name}]")
+        if auto_id and attr_id and VolatilityClassifier.classify_id_volatility(auto_id) != VolatilityVerdict.VOLATILE:
             val_id = escape_xpath_literal(auto_id)
-            child_patterns.append(f"//{tag}[@AutomationId={val_id}]")
-        if cls_name and not self.is_structurally_generic(node):
+            child_patterns.append(f"//{tag}[@{attr_id}={val_id}]")
+        if attr_cls and cls_name and not self.is_structurally_generic(node):
             first_tok = cls_name.split()[0]
             if len(first_tok) >= 4:
                 val_tok = escape_xpath_literal(first_tok)
-                child_patterns.append(f"//{tag}[contains(@ClassName, {val_tok})]")
+                child_patterns.append(f"//{tag}[contains(@{attr_cls}, {val_tok})]")
 
         # 1. Direct Parent semantic container
         parent = node.parent
-        if parent and parent.tag in ("TitleBar", "ToolBar", "MenuBar", "TabItem", "Tab", "ListItem", "Header"):
+        if parent and parent.tag in dialect.semantic_parent_tags:
             if parent.name:
                 val_pname = escape_xpath_literal(parent.name)
                 for child_expr in child_patterns:
                     results.append(XPathCandidate(
-                        xpath=f"//{parent.tag}[@Name={val_pname}]{child_expr}",
+                        xpath=f"//{parent.tag}[@{parent.name_attr}={val_pname}]{child_expr}",
                         tier=XPathTier.T3_DIRECT_PARENT_SCOPED,
                         localization_risk=bool(name or parent.name)
                     ))
@@ -416,44 +436,44 @@ class XPathGenerator:
         # 2. Meaningful Ancestor Filter (Windows, ID containers, named panels)
         meaningful_ancestors: List[UINode] = []
         for anc in ancestors:
-            if anc.tag == "Window" or anc.depth <= 2:
+            if anc.tag == window_tag or anc.depth <= 2:
                 meaningful_ancestors.append(anc)
-            elif anc.name and not self.is_structurally_generic(anc) and anc.tag not in ("Pane", "Group"):
+            elif anc.name and not self.is_structurally_generic(anc) and anc.tag not in dialect.noisy_container_tags:
                 meaningful_ancestors.append(anc)
             elif anc.automation_id and VolatilityClassifier.classify_id_volatility(anc.automation_id) != VolatilityVerdict.VOLATILE:
                 meaningful_ancestors.append(anc)
-            elif anc.tag in ("TitleBar", "ToolBar", "Document"):
+            elif anc.tag in dialect.structural_anchor_tags:
                 meaningful_ancestors.append(anc)
 
         for anc in meaningful_ancestors:
             anc_anchors: List[str] = []
 
-            if anc.tag == "Window":
+            if anc.tag == window_tag:
                 anc_auto_id = anc.automation_id
-                if anc_auto_id and VolatilityClassifier.classify_id_volatility(anc_auto_id) == VolatilityVerdict.STATIC:
+                if anc_auto_id and attr_id and VolatilityClassifier.classify_id_volatility(anc_auto_id) == VolatilityVerdict.STATIC:
                     val_aid = escape_xpath_literal(anc_auto_id)
-                    anc_anchors.append(f"//Window[@AutomationId={val_aid}]")
+                    anc_anchors.append(f"//{window_tag}[@{attr_id}={val_aid}]")
                 if anc.name:
                     stable_sub = VolatilityClassifier.extract_stable_substring(anc.name)
                     if stable_sub and anc.name.startswith(stable_sub):
                         val_short = escape_xpath_literal(stable_sub)
-                        anc_anchors.append(f"//Window[starts-with(@Name, {val_short})]")
+                        anc_anchors.append(f"//{window_tag}[starts-with(@{anc.name_attr}, {val_short})]")
                     val_aname = escape_xpath_literal(anc.name)
-                    anc_anchors.append(f"//Window[@Name={val_aname}]")
+                    anc_anchors.append(f"//{window_tag}[@{anc.name_attr}={val_aname}]")
             elif anc.name:
                 val_aname = escape_xpath_literal(anc.name)
-                anc_anchors.append(f"//{anc.tag}[@Name={val_aname}]")
+                anc_anchors.append(f"//{anc.tag}[@{anc.name_attr}={val_aname}]")
 
             anc_auto_id = anc.automation_id
-            if anc.tag != "Window" and anc_auto_id and VolatilityClassifier.classify_id_volatility(anc_auto_id) != VolatilityVerdict.VOLATILE:
+            if anc.tag != window_tag and anc_auto_id and attr_id and VolatilityClassifier.classify_id_volatility(anc_auto_id) != VolatilityVerdict.VOLATILE:
                 val_aid = escape_xpath_literal(anc_auto_id)
-                anc_anchors.append(f"//*[@AutomationId={val_aid}]")
+                anc_anchors.append(f"//*[@{attr_id}={val_aid}]")
 
-            if anc.class_name and not self.is_structurally_generic(anc):
+            if attr_cls and anc.class_name and not self.is_structurally_generic(anc):
                 first_tok = anc.class_name.split()[0]
                 if len(first_tok) >= 4:
                     val_atok = escape_xpath_literal(first_tok)
-                    anc_anchors.append(f"//{anc.tag}[contains(@ClassName, {val_atok})]")
+                    anc_anchors.append(f"//{anc.tag}[contains(@{attr_cls}, {val_atok})]")
 
             # Combine meaningful ancestor anchors with child patterns
             for anc_expr in anc_anchors:
@@ -484,13 +504,15 @@ class XPathGenerator:
         """Generate ancestor-scoped positional selectors for non-identifiable elements."""
         results: List[XPathCandidate] = []
         ancestors = TreeParser.get_ancestors(node)
+        dialect = node.driver_dialect
+        attr_id = dialect.attr_automation_id
         tag = node.tag
         is_data_dep = node.is_within_repeating_container()
 
         meaningful_ancestors = [
             a for a in ancestors
-            if a.tag in ("Window", "TitleBar", "ToolBar", "TabItem")
-            or (a.name and not self.is_structurally_generic(a) and a.tag not in ("Pane", "Group"))
+            if a.tag in dialect.positional_anchor_tags
+            or (a.name and not self.is_structurally_generic(a) and a.tag not in dialect.noisy_container_tags)
             or (a.automation_id and VolatilityClassifier.classify_id_volatility(a.automation_id) != VolatilityVerdict.VOLATILE)
         ]
 
@@ -498,11 +520,11 @@ class XPathGenerator:
             anc_anchors: List[str] = []
             if anc.name:
                 val_aname = escape_xpath_literal(anc.name)
-                anc_anchors.append(f"//{anc.tag}[@Name={val_aname}]")
-            elif anc.automation_id and VolatilityClassifier.classify_id_volatility(anc.automation_id) != VolatilityVerdict.VOLATILE:
+                anc_anchors.append(f"//{anc.tag}[@{anc.name_attr}={val_aname}]")
+            elif anc.automation_id and attr_id and VolatilityClassifier.classify_id_volatility(anc.automation_id) != VolatilityVerdict.VOLATILE:
                 val_aid = escape_xpath_literal(anc.automation_id)
-                anc_anchors.append(f"//*[@AutomationId={val_aid}]")
-            elif anc.tag in ("TitleBar", "ToolBar"):
+                anc_anchors.append(f"//*[@{attr_id}={val_aid}]")
+            elif anc.tag in dialect.bare_anchor_tags:
                 anc_anchors.append(f"//{anc.tag}")
 
             pos = self._get_subtree_position(node, anc)
@@ -538,34 +560,36 @@ class XPathGenerator:
         )
 
     def _prepend_window_container(self, candidate: XPathCandidate, node: UINode) -> XPathCandidate:
-        """Prepend top-level //Window[@Name='...'] to selector if not already present."""
-        if candidate.is_diagnostic_only or candidate.xpath.startswith("//Window"):
+        """Prepend the top-level window selector (//Window[@Name='...']) if not already present."""
+        dialect = node.driver_dialect
+        window_tag = dialect.window_tag
+        if candidate.is_diagnostic_only or candidate.xpath.startswith(f"//{window_tag}"):
             return candidate
 
         ancestors = TreeParser.get_ancestors(node)
-        win_anc = next((a for a in reversed(ancestors) if a.tag == "Window"), None)
+        win_anc = next((a for a in reversed(ancestors) if a.tag == window_tag), None)
 
         if not win_anc:
             cache = TreeCacheStore.instance().get_active()
-            if cache and cache.parsed_root and cache.parsed_root.tag == "Window":
+            if cache and cache.parsed_root and cache.parsed_root.tag == window_tag:
                 win_anc = cache.parsed_root
             elif cache and cache.parsed_root:
-                win_anc = next((c for c in cache.parsed_root.children if c.tag == "Window"), None)
+                win_anc = next((c for c in cache.parsed_root.children if c.tag == window_tag), None)
 
         if win_anc:
             if win_anc.name:
                 stable_sub = VolatilityClassifier.extract_stable_substring(win_anc.name)
                 if stable_sub and win_anc.name.startswith(stable_sub):
                     val = escape_xpath_literal(stable_sub)
-                    prefix = f"//Window[starts-with(@Name, {val})]"
+                    prefix = f"//{window_tag}[starts-with(@{win_anc.name_attr}, {val})]"
                 else:
                     val = escape_xpath_literal(win_anc.name)
-                    prefix = f"//Window[@Name={val}]"
-            elif win_anc.automation_id:
+                    prefix = f"//{window_tag}[@{win_anc.name_attr}={val}]"
+            elif win_anc.automation_id and dialect.attr_automation_id:
                 val = escape_xpath_literal(win_anc.automation_id)
-                prefix = f"//Window[@AutomationId={val}]"
+                prefix = f"//{window_tag}[@{dialect.attr_automation_id}={val}]"
             else:
-                prefix = "//Window"
+                prefix = f"//{window_tag}"
 
             return dataclasses.replace(candidate, xpath=f"{prefix}{candidate.xpath}")
         return candidate

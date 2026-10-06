@@ -78,7 +78,7 @@ class MainWindow(QMainWindow):
     def __init__(self, config: XGenConfig, start_hooks: bool = True, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.config = config
-        self.setWindowTitle("xGen — Windows XPath Inspector")
+        self.setWindowTitle("xGen — XPath Inspector")
         self.setMinimumSize(850, 500)
         self.setStyleSheet("""
             QMainWindow { background: #0c0e12; color: #f1f5f9; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
@@ -374,8 +374,74 @@ class MainWindow(QMainWindow):
         self.toolbar.combo_windows.setCurrentIndex(matched_idx)
         self.toolbar.combo_windows.blockSignals(False)
 
+    def _confirm_target_switch(self, target_name: str) -> bool:
+        """Ask before reconnecting to a different target; returns True to proceed."""
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Switch Target?")
+        msg_box.setText(
+            f"Appium will reconnect to switch the session to <b>{target_name}</b>.<br><br>"
+            "Do you want to proceed?"
+        )
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        btn_allow = msg_box.button(QMessageBox.StandardButton.Ok)
+        if btn_allow:
+            btn_allow.setText("Allow")
+        msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
+
+        cb_remember = QCheckBox("Remember my choice (don't ask again)")
+        cb_remember.setStyleSheet("QCheckBox { color: #cbd5e1; font-size: 11px; margin-top: 8px; }")
+        msg_box.setCheckBox(cb_remember)
+
+        if msg_box.exec() != QMessageBox.StandardButton.Ok:
+            return False
+        if cb_remember.isChecked():
+            self.config.confirm_reconnect_switch = False
+            ConfigManager.save(self.config)
+        return True
+
+    def _target_for_handle(self, handle: str):
+        """Resolve a toolbar handle back to the enumerated target it came from."""
+        for w in getattr(self, "_last_window_targets", []) or []:
+            if getattr(w, "handle_hex", "") == handle:
+                return w
+        return None
+
     def _on_window_switched(self, handle: str) -> None:
         target_title = self.toolbar.combo_windows.currentText()
+
+        # macOS: the picker lists applications, so switching means pointing the
+        # session at another bundle ID rather than another window handle.
+        target = self._target_for_handle(handle)
+        bundle_id = getattr(target, "bundle_id", "") if target is not None else ""
+        if bundle_id:
+            if self.config.app_bundle_id == bundle_id and self.session_manager.is_connected:
+                return
+            self.config.app_bundle_id = bundle_id
+            self.config.app_top_level_window = ""
+            self.config.app_path = ""
+            app_label = target_title or getattr(target, "title", "") or bundle_id
+
+            if not self.session_manager.is_connected:
+                self.status_bar.lbl_msg.setText(
+                    f"🎯 Target selected: {app_label}. Click 🔴 Status Dot to connect."
+                )
+                return
+
+            if getattr(self.config, "confirm_reconnect_switch", True):
+                if not self._confirm_target_switch(app_label):
+                    return
+
+            if self.inspect_mode.is_active:
+                self.inspect_mode.deactivate()
+                self.toolbar.set_inspect_active(False)
+
+            logger.info("Reconnecting session to application: %s", bundle_id)
+            self.status_bar.lbl_msg.setText(f"Reconnecting to switch target to {app_label}...")
+            self.tree_fetcher.cancel()
+            self.session_manager.reconnect(self.config)
+            return
+
         if not self.session_manager.is_connected:
             if not handle or handle == "Root":
                 self.config.app_top_level_window = ""
@@ -448,7 +514,9 @@ class MainWindow(QMainWindow):
     def _on_refresh_requested(self) -> None:
         """Triggered on Ctrl+R or toolbar Refresh click: refresh tree and window list."""
         self.toolbar.set_refreshing(True)
-        self.tree_fetcher.fetch_full()
+        # queue_if_busy: a refresh the user asked for is honoured even if one is
+        # already running, instead of being dropped and looking like a no-op.
+        self.tree_fetcher.fetch_full(queue_if_busy=True)
         self._refresh_window_picker()
 
     def _refresh_window_picker(self, selected_handle: Optional[str] = None) -> None:
@@ -476,6 +544,17 @@ class MainWindow(QMainWindow):
 
     def _on_windows_enumerated(self, windows: list, selected_handle: Optional[str]) -> None:
         """Apply a background window-enumeration result to the toolbar's window selector."""
+        # Keep the full targets so _on_window_switched can resolve a handle back
+        # to its app. On macOS the picker lists applications, and a session is
+        # started from a bundle ID, not from the window id shown as the handle.
+        self._last_window_targets = list(windows or [])
+
+        if not selected_handle and getattr(self.config, "app_bundle_id", ""):
+            for w in self._last_window_targets:
+                if getattr(w, "bundle_id", "") == self.config.app_bundle_id:
+                    selected_handle = w.handle_hex
+                    break
+
         if not selected_handle:
             if self.session_manager.is_connected and self.session_manager.session_info and self.session_manager.session_info.active_handle:
                 selected_handle = self.session_manager.session_info.active_handle
@@ -1131,11 +1210,24 @@ class MainWindow(QMainWindow):
         try:
             hwnd = backend.window_from_point(screen_x, screen_y)
             if hwnd:
+                # Ask the backend for the overlay's id in the same number space
+                # window_from_point() uses. Qt's winId() only matches that on
+                # Windows; on macOS it is an NSView pointer, so comparing the
+                # two matched nothing — the overlay then looked like "some
+                # other xGen window", hover was suppressed, the overlay hid,
+                # and the next tick showed it again: a visible 10Hz blink.
                 try:
-                    overlay_hwnd = int(self.overlay.winId())
+                    overlay_hwnd = backend.native_window_id_for_widget(self.overlay)
                 except Exception:
                     overlay_hwnd = None
-                if hwnd != overlay_hwnd:
+
+                if overlay_hwnd is None:
+                    # Backend can't identify its own windows. Skip the own-PID
+                    # check rather than risk it misfiring on the overlay and
+                    # oscillating; step 2's geometry test below still covers
+                    # xGen's main window.
+                    pass
+                elif hwnd != overlay_hwnd:
                     pid = backend.get_process_id_for_window(hwnd)
                     if pid == os.getpid():
                         return False

@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
@@ -103,8 +104,30 @@ class SessionDialog(QDialog):
         # Radio button group for target mode
         self.target_group = QButtonGroup(self)
 
+        # 0. Target platform (which Appium driver is on the other end).
+        # Not inferred from the machine xGen runs on: the Appium URL below can
+        # point at another box entirely, so driving a Mac from Windows (or the
+        # reverse) is a supported setup.
+        platform_row = QHBoxLayout()
+        platform_row.setSpacing(6)
+        lbl_platform = QLabel("Target platform:")
+        lbl_platform.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+        self.combo_platform = QComboBox()
+        self.combo_platform.addItem("Auto (this machine)", "")
+        self.combo_platform.addItem("Windows — Appium Windows Driver", "windows")
+        self.combo_platform.addItem("macOS — Appium Mac2 Driver", "mac")
+        self.combo_platform.setToolTip(
+            "Which Appium driver the server at the URL below is running.\n"
+            "Auto picks the OS xGen itself is running on."
+        )
+        self.combo_platform.currentIndexChanged.connect(self._on_platform_changed)
+        platform_row.addWidget(lbl_platform)
+        platform_row.addWidget(self.combo_platform, 1)
+        main_layout.addLayout(platform_row)
+
         # 1. Target Window / Application Picker Card
         lbl_target_hdr = QLabel("RUNNING WINDOW TARGET")
+        self.lbl_target_hdr = lbl_target_hdr
         lbl_target_hdr.setObjectName("section_title")
         main_layout.addWidget(lbl_target_hdr)
 
@@ -174,11 +197,42 @@ class SessionDialog(QDialog):
         app_path_row.addWidget(self.btn_browse)
         launch_card_layout.addWidget(self.app_path_row_widget)
 
+        # macOS: Appium's Mac2 driver targets an application, usually by bundle
+        # identifier, so this row replaces the .exe path when macOS is selected.
+        self.bundle_id_row_widget = QWidget()
+        bundle_row = QHBoxLayout(self.bundle_id_row_widget)
+        bundle_row.setContentsMargins(0, 0, 0, 0)
+        bundle_row.setSpacing(6)
+        self.bundle_id_edit = QLineEdit()
+        self.bundle_id_edit.setPlaceholderText("com.apple.TextEdit")
+        self.bundle_id_edit.setToolTip(
+            "Bundle identifier of the macOS app to inspect.\n"
+            "Leave the app path empty to use this instead."
+        )
+        self.bundle_id_edit.textChanged.connect(self._on_app_path_text_changed)
+        bundle_row.addWidget(QLabel("Bundle ID:"))
+        bundle_row.addWidget(self.bundle_id_edit, 1)
+        launch_card_layout.addWidget(self.bundle_id_row_widget)
+        self.bundle_id_row_widget.hide()
+
+        self.chk_attach_running = QCheckBox("Attach to the app as it is, without relaunching it")
+        self.chk_attach_running.setToolTip("Mac2Driver appium:noReset — keeps the app's current state and windows")
+        self.chk_attach_running.setStyleSheet("""
+            QCheckBox { color: #cbd5e1; font-size: 11px; padding: 2px 0; }
+            QCheckBox:hover { color: #ffffff; }
+            QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #334155; background: #181c24; }
+            QCheckBox::indicator:checked { background: #2563eb; border-color: #3b82f6; }
+        """)
+        launch_card_layout.addWidget(self.chk_attach_running)
+        self.chk_attach_running.hide()
+
         lbl_exe_hint = QLabel("Starts a new application process from disk and connects inspection to its main window.")
+        self.lbl_exe_hint = lbl_exe_hint
         lbl_exe_hint.setStyleSheet("color: #64748b; font-size: 10px;")
         launch_card_layout.addWidget(lbl_exe_hint)
 
         main_layout.addWidget(launch_card)
+        self.lbl_launch_hdr = lbl_launch_hdr
 
         # Wire mutual mode toggle
         self.rb_window.toggled.connect(self._on_mode_toggled)
@@ -203,6 +257,26 @@ class SessionDialog(QDialog):
         url_row.addWidget(self.appium_url_edit)
         url_row.addWidget(self.btn_test_url)
         server_layout.addRow("Appium URL:", url_row)
+
+        # Free-form capabilities, merged into the session last. Driver options
+        # differ widely (Mac2 alone has arguments/environment/prerun/appLocale/
+        # webDriverAgentMacUrl), so this is deliberately open rather than a
+        # fixed set of fields xGen would have to keep chasing.
+        self.caps_edit = QPlainTextEdit()
+        self.caps_edit.setPlaceholderText(
+            '{\n  "appium:showServerLogs": true,\n  "appium:arguments": ["--demo"]\n}'
+        )
+        self.caps_edit.setToolTip(
+            "Extra Appium capabilities as a JSON object.\n"
+            "Merged in last, so these override anything xGen sets."
+        )
+        self.caps_edit.setFixedHeight(76)
+        self.caps_edit.setStyleSheet(
+            "QPlainTextEdit { background: #181c24; color: #f1f5f9; border: 1px solid #2a3140;"
+            "                 border-radius: 6px; padding: 6px 8px; font-family: monospace; font-size: 10px; }"
+            "QPlainTextEdit:focus { border-color: #3b82f6; }"
+        )
+        server_layout.addRow("Capabilities:", self.caps_edit)
 
         main_layout.addWidget(server_card)
 
@@ -251,13 +325,57 @@ class SessionDialog(QDialog):
         button_row.addWidget(self.btn_connect)
         main_layout.addLayout(button_row)
 
+    def _target_platform_key(self) -> str:
+        """"windows" or "mac" for the current selection, resolving Auto."""
+        choice = self.combo_platform.currentData() if hasattr(self, "combo_platform") else ""
+        if choice:
+            return "mac" if choice == "mac" else "windows"
+        try:
+            from xgen.platform.factory import get_platform_backend
+            return get_platform_backend().default_driver_platform()
+        except Exception:
+            return "windows"
+
+    def _on_platform_changed(self, _index: int = 0) -> None:
+        """Relabel the dialog for the selected driver (Mac targets apps, not window handles)."""
+        is_mac = self._target_platform_key() == "mac"
+
+        self.bundle_id_row_widget.setVisible(is_mac)
+        self.chk_attach_running.setVisible(is_mac)
+
+        if is_mac:
+            self.lbl_target_hdr.setText("RUNNING APPLICATION TARGET")
+            self.rb_window.setText("Attach to a Running Application (picked by window)")
+            self.lbl_launch_hdr.setText("LAUNCH APPLICATION (.APP OR BUNDLE ID)")
+            self.rb_launch_exe.setText("Launch or Attach to an Application by Path / Bundle ID")
+            self.app_path_edit.setPlaceholderText("/Applications/TextEdit.app")
+            self.lbl_exe_hint.setText(
+                "Appium's Mac2 driver attaches to one application at a time — macOS has no "
+                "desktop-wide equivalent of Windows' Desktop Root target."
+            )
+        else:
+            self.lbl_target_hdr.setText("RUNNING WINDOW TARGET")
+            self.rb_window.setText("Attach to Running Window or Desktop Root")
+            self.lbl_launch_hdr.setText("LAUNCH APPLICATION EXECUTABLE (.EXE)")
+            self.rb_launch_exe.setText("Launch New Application Process from Executable (.exe)")
+            self.app_path_edit.setPlaceholderText("C:\\Program Files\\...\\app.exe")
+            self.lbl_exe_hint.setText(
+                "Starts a new application process from disk and connects inspection to its main window."
+            )
+
+        self._on_mode_toggled(self.rb_window.isChecked())
+
     def _on_mode_toggled(self, is_window: bool) -> None:
         self.combo_target.setEnabled(is_window)
         self.btn_refresh_targets.setEnabled(is_window)
         self.app_path_edit.setEnabled(not is_window)
         self.btn_browse.setEnabled(not is_window)
+        self.bundle_id_edit.setEnabled(not is_window)
         if is_window:
             self._on_target_changed(self.combo_target.currentIndex())
+        elif self._target_platform_key() == "mac":
+            self.lbl_target_badge.setText("Target: Application by path or bundle ID")
+            self.lbl_target_badge.show()
         else:
             self.lbl_target_badge.setText("Target: Launch new process from executable path")
             self.lbl_target_badge.show()
@@ -296,6 +414,12 @@ class SessionDialog(QDialog):
             if data.is_root:
                 self.lbl_target_badge.setText("Target: Desktop Root (Entire OS)")
                 self.lbl_target_badge.show()
+            elif self._target_platform_key() == "mac":
+                # A window only identifies the app it belongs to here; say so
+                # rather than showing a handle the Mac driver can't use.
+                app_part = data.bundle_id or data.exe_name or "unknown app"
+                self.lbl_target_badge.setText(f"Application: {app_part}")
+                self.lbl_target_badge.show()
             else:
                 exe_part = f"  |  Exe: {data.exe_name}" if data.exe_name else ""
                 self.lbl_target_badge.setText(f"HWND Handle: {data.handle_hex}{exe_part}")
@@ -314,12 +438,20 @@ class SessionDialog(QDialog):
     def _populate_from_config(self, cfg: XGenConfig) -> None:
         self.appium_url_edit.setText(cfg.appium_url or "http://127.0.0.1:4723")
         self.app_path_edit.setText(cfg.app_path or "")
+        self.bundle_id_edit.setText(getattr(cfg, "app_bundle_id", "") or "")
+        self.chk_attach_running.setChecked(bool(getattr(cfg, "attach_to_running", False)))
+        self.caps_edit.setPlainText(getattr(cfg, "extra_capabilities", "") or "")
         self.chk_confirm_disconnect.setChecked(getattr(cfg, "confirm_disconnect", True))
         self.chk_confirm_reconnect_switch.setChecked(getattr(cfg, "confirm_reconnect_switch", True))
 
+        saved_platform = getattr(cfg, "target_platform", "") or ""
+        platform_idx = self.combo_platform.findData(saved_platform)
+        self.combo_platform.setCurrentIndex(platform_idx if platform_idx >= 0 else 0)
+        self._on_platform_changed()
+
         self._refresh_window_combo()
 
-        if cfg.app_path:
+        if cfg.app_path or getattr(cfg, "app_bundle_id", ""):
             self.rb_launch_exe.setChecked(True)
         elif cfg.app_top_level_window:
             self.rb_window.setChecked(True)
@@ -350,12 +482,20 @@ class SessionDialog(QDialog):
 
     def _browse_app_path(self) -> None:
         self.rb_launch_exe.setChecked(True)
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Target Application Executable",
-            "C:\\Program Files",
-            "Executables (*.exe);;All Files (*.*)"
-        )
+        if self._target_platform_key() == "mac":
+            # .app bundles are directories, so the file picker has to allow one.
+            path = QFileDialog.getExistingDirectory(
+                self,
+                "Select Target Application (.app)",
+                "/Applications",
+            )
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Target Application Executable",
+                "C:\\Program Files",
+                "Executables (*.exe);;All Files (*.*)"
+            )
         if path:
             self.app_path_edit.setText(path)
 
@@ -419,24 +559,59 @@ class SessionDialog(QDialog):
         self._ping_thread = None
         self._ping_worker = None
 
+    def _warn(self, message: str) -> None:
+        self.lbl_status.setText(message)
+        self.lbl_status.setStyleSheet(
+            "background: #451a03; color: #fbbf24; border: 1px solid #b45309; border-radius: 6px;"
+            " padding: 6px 10px; font-weight: 600; font-size: 11px;"
+        )
+
     def _on_connect_clicked(self) -> None:
         url = self.appium_url_edit.text().strip() or "http://127.0.0.1:4723"
         app_path = ""
         app_window = ""
+        bundle_id = ""
+        is_mac = self._target_platform_key() == "mac"
+
+        # Validate custom capabilities here rather than letting the driver
+        # reject the session with a less helpful error.
+        caps_text = self.caps_edit.toPlainText().strip()
+        try:
+            SessionManager.parse_extra_capabilities(caps_text)
+        except ValueError as e:
+            self._warn(f"⚠️ Capabilities: {e}")
+            return
 
         if self.rb_launch_exe.isChecked():
             app_path = self.app_path_edit.text().strip()
-            if not app_path:
-                self.lbl_status.setText("⚠️ Please specify an application executable path.")
+            bundle_id = self.bundle_id_edit.text().strip() if is_mac else ""
+            if not app_path and not bundle_id:
+                msg = (
+                    "⚠️ Please specify an application path or bundle ID."
+                    if is_mac else
+                    "⚠️ Please specify an application executable path."
+                )
+                self.lbl_status.setText(msg)
                 self.lbl_status.setStyleSheet("background: #451a03; color: #fbbf24; border: 1px solid #b45309; border-radius: 6px; padding: 6px 10px; font-weight: 600; font-size: 11px;")
                 return
-            session_name = Path(app_path).stem
+            session_name = Path(app_path).stem if app_path else bundle_id
         else:
             data = self.combo_target.currentData()
             if isinstance(data, WindowTarget):
                 if data.is_root:
                     app_path = ""
                     session_name = "Desktop Root"
+                elif is_mac:
+                    # Mac2Driver attaches to an application, so a picked window
+                    # resolves to its owning app rather than a window handle.
+                    bundle_id = data.bundle_id
+                    session_name = data.exe_name or data.title or "Application"
+                    if not bundle_id:
+                        self.lbl_status.setText(
+                            "⚠️ Could not resolve a bundle ID for that window — enter one below instead."
+                        )
+                        self.lbl_status.setStyleSheet("background: #451a03; color: #fbbf24; border: 1px solid #b45309; border-radius: 6px; padding: 6px 10px; font-weight: 600; font-size: 11px;")
+                        return
                 else:
                     app_window = data.handle_hex
                     session_name = data.title or f"Window {data.handle_hex}"
@@ -447,6 +622,10 @@ class SessionDialog(QDialog):
         self.config.appium_url = url
         self.config.app_path = app_path
         self.config.app_top_level_window = app_window
+        self.config.app_bundle_id = bundle_id
+        self.config.target_platform = self.combo_platform.currentData() or ""
+        self.config.attach_to_running = bool(is_mac and self.chk_attach_running.isChecked())
+        self.config.extra_capabilities = caps_text
         self.config.confirm_disconnect = self.chk_confirm_disconnect.isChecked()
         self.config.confirm_reconnect_switch = self.chk_confirm_reconnect_switch.isChecked()
 
@@ -455,7 +634,9 @@ class SessionDialog(QDialog):
             name=session_name,
             app_path=self.config.app_path,
             app_top_level_window=app_window,
-            appium_url=url
+            appium_url=url,
+            app_bundle_id=bundle_id,
+            target_platform=self.config.target_platform,
         )
         ConfigManager.add_recent_session(self.config, recent)
         ConfigManager.save(self.config)

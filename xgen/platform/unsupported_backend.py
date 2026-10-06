@@ -55,6 +55,9 @@ class UnsupportedBackend:
     def get_process_id_for_window(self, hwnd: int) -> Optional[int]:
         return None
 
+    def native_window_id_for_widget(self, widget: object) -> Optional[int]:
+        return None
+
     # --- Overlay native styling ---
 
     def apply_click_through(self, widget: object) -> None:
@@ -95,3 +98,16 @@ class UnsupportedBackend:
 
     def set_app_user_model_id(self, app_id: str) -> None:
         pass
+
+    # --- Input suppression ---
+
+    def mouse_filter_kwarg_name(self) -> Optional[str]:
+        return None
+
+    def decode_mouse_button_event(self, event_type: object, native_event: object) -> Optional[Tuple[int, int, bool]]:
+        return None
+
+    def default_driver_platform(self) -> str:
+        # No native backend here, but a user on Linux can still point xGen at
+        # a remote Appium server; Windows stays the historical default.
+        return "windows"

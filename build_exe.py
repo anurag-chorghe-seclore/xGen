@@ -1,6 +1,8 @@
 """
-xGen Windows Standalone Executable Build Script.
-Packages xGen into a standalone Windows binary using PyInstaller.
+xGen Standalone Executable Build Script.
+Packages xGen into a standalone Windows (.exe) or macOS (.app) binary using
+PyInstaller, driven by the single cross-platform xgen.spec (see its own
+comment for why one shared spec file is used instead of a second one).
 """
 
 from __future__ import annotations
@@ -26,8 +28,9 @@ def build() -> None:
     dist_dir = root / "dist"
     build_dir = root / "build"
 
+    target_desc = "macOS Application (.app)" if sys.platform == "darwin" else "Windows Executable (.exe)"
     print("=" * 60)
-    print("Building xGen Production Windows Executable (.exe)")
+    print(f"Building xGen Production {target_desc}")
     print("=" * 60)
 
     if spec_file.exists():
@@ -71,9 +74,10 @@ def build() -> None:
     res = subprocess.run(cmd, cwd=str(root))
 
     if res.returncode == 0:
+        output_path = (dist_dir / "xGen.app") if sys.platform == "darwin" else (dist_dir / "xGen" / "xGen.exe")
         print("\n" + "=" * 60)
         print("[OK] Build Successful!")
-        print(f"Executable output: {dist_dir / 'xGen' / 'xGen.exe'}")
+        print(f"Output: {output_path}")
         print("=" * 60)
     else:
         print(f"\n[FAIL] Build failed with exit code {res.returncode}")

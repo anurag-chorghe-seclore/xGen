@@ -102,6 +102,19 @@ class PlatformBackend(Protocol):
         """Owning process id for a window handle, or None."""
         ...
 
+    def native_window_id_for_widget(self, widget: object) -> Optional[int]:
+        """
+        The id for a Qt widget's own window **in the same number space
+        window_from_point() returns**, so a caller can tell "that's my own
+        overlay" from "that's somebody else's window".
+
+        Qt's winId() is only that id on Windows, where it is the HWND. On
+        macOS winId() is an NSView pointer while window_from_point() returns a
+        CGWindowID — comparing the two matches nothing, which silently breaks
+        the overlay self-check and makes hover flicker. Ask this instead.
+        """
+        ...
+
     # --- Overlay window native styling ---
 
     def apply_click_through(self, widget: object) -> None:
@@ -144,4 +157,35 @@ class PlatformBackend(Protocol):
 
     def set_app_user_model_id(self, app_id: str) -> None:
         """Set the OS-level app identity used for taskbar grouping/icon, if applicable. No-op if not."""
+        ...
+
+    def default_driver_platform(self) -> str:
+        """
+        Which Appium driver a *new* session should target by default on this
+        machine: "windows" or "mac". Only a default — the user can point xGen
+        at an Appium server running on the other OS, and the session's own
+        capabilities always win (see xgen/core/driver_dialect.py). It lives
+        here so that "what OS is this" stays behind the platform seam.
+        """
+        ...
+
+    # --- Input suppression (xgen.capture.mouse_hook's native click-suppression hook) ---
+    #
+    # Windows' suppression wiring (pynput's win32_event_filter) predates these two
+    # methods and is handled directly in mouse_hook.py without going through them —
+    # they exist so a *second* backend (macOS today) can plug into the same pynput
+    # suppression mechanism without mouse_hook.py ever importing a platform package
+    # itself. Only meaningful for a backend whose kwarg uses "return the event to
+    # pass it through, return something else to suppress it" semantics (pynput's
+    # darwin_intercept shape) — see mouse_hook.py's _platform_intercept.
+
+    def mouse_filter_kwarg_name(self) -> Optional[str]:
+        """pynput mouse.Listener kwarg name for native click suppression on this OS
+        (e.g. "darwin_intercept"), or None if this backend doesn't support one."""
+        ...
+
+    def decode_mouse_button_event(self, event_type: object, native_event: object) -> Optional[Tuple[int, int, bool]]:
+        """Given this OS's raw suppression-callback arguments, return (x, y, is_press)
+        for a left mouse button event in this backend's own screen-pixel convention,
+        or None if the event isn't one xGen needs to act on."""
         ...

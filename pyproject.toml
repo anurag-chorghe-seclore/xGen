@@ -16,9 +16,11 @@ keywords = ["appium", "winappdriver", "xpath", "windows-automation", "uiautomati
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -35,6 +37,10 @@ dependencies = [
     "uiautomation>=2.0.18; sys_platform == 'win32'",
     "pynput>=1.7.6",
     "pywin32>=306; sys_platform == 'win32'",
+    "pyobjc-core>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

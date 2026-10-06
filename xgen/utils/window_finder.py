@@ -19,8 +19,12 @@ class WindowTarget:
     title: str
     handle_hex: str   # e.g. "0x000E07FA"  (empty for Desktop Root)
     hwnd: int         # Raw HWND integer (0 for Desktop Root)
-    exe_name: str     # e.g. "notepad.exe"  (empty for Desktop Root)
+    exe_name: str     # e.g. "notepad.exe" / "TextEdit"  (empty for Desktop Root)
     is_root: bool = field(default=False)
+    # macOS only: the owning app's bundle identifier (com.apple.TextEdit).
+    # Appium's Mac2 driver targets an application, not a window handle, so
+    # this is what a picked window turns into when starting a Mac session.
+    bundle_id: str = ""
 
     def display_label(self) -> str:
         if self.is_root:

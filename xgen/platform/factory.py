@@ -24,6 +24,9 @@ def get_platform_backend() -> "PlatformBackend":
         if sys.platform == "win32":
             from xgen.platform.windows_backend import WindowsBackend
             _backend_instance = WindowsBackend()
+        elif sys.platform == "darwin":
+            from xgen.platform.mac_backend import MacBackend
+            _backend_instance = MacBackend()
         else:
             from xgen.platform.unsupported_backend import UnsupportedBackend
             _backend_instance = UnsupportedBackend()

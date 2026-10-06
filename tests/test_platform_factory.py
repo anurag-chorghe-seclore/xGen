@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from xgen.platform.factory import get_platform_backend, reset_platform_backend_for_tests
+from xgen.platform.mac_backend import MacBackend
 from xgen.platform.unsupported_backend import UnsupportedBackend
 from xgen.platform.windows_backend import WindowsBackend
 
@@ -27,8 +28,14 @@ def test_returns_windows_backend_on_win32(monkeypatch):
     assert isinstance(backend, WindowsBackend)
 
 
-@pytest.mark.parametrize("plat", ["linux", "darwin"])
-def test_returns_unsupported_backend_off_windows(monkeypatch, plat):
+def test_returns_mac_backend_on_darwin(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    backend = get_platform_backend()
+    assert isinstance(backend, MacBackend)
+
+
+@pytest.mark.parametrize("plat", ["linux", "freebsd"])
+def test_returns_unsupported_backend_on_other_platforms(monkeypatch, plat):
     monkeypatch.setattr(sys, "platform", plat)
     backend = get_platform_backend()
     assert isinstance(backend, UnsupportedBackend)

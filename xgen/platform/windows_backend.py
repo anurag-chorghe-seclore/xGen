@@ -457,6 +457,13 @@ class WindowsBackend:
         except Exception:
             return None
 
+    def native_window_id_for_widget(self, widget: object) -> Optional[int]:
+        """On Windows, Qt's winId() already is the HWND that WindowFromPoint returns."""
+        try:
+            return int(widget.winId())  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Overlay native styling (moved from xgen/capture/overlay_window.py)
     # ------------------------------------------------------------------
@@ -621,3 +628,20 @@ class WindowsBackend:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Input suppression
+    # ------------------------------------------------------------------
+    # Not used on this path: capture/mouse_hook.py wires Windows' own
+    # win32_event_filter directly (predates this pair of methods, added
+    # for macOS — see backend.py). Implemented here only for interface
+    # completeness/consistency.
+
+    def mouse_filter_kwarg_name(self) -> Optional[str]:
+        return None
+
+    def decode_mouse_button_event(self, event_type: object, native_event: object) -> Optional[Tuple[int, int, bool]]:
+        return None
+
+    def default_driver_platform(self) -> str:
+        return "windows"

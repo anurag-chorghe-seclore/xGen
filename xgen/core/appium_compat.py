@@ -1,12 +1,20 @@
 """
-Appium Windows Driver XPath Compatibility & Readability Normalization Layer.
-Ensures every candidate conforms strictly to the supported XPath 1.0 subset in Appium Windows Driver / WinAppDriver.
+Appium XPath Compatibility & Readability Normalization Layer.
+
+Which constructs are rejected depends on the driver on the other end: the
+Appium Windows Driver / WinAppDriver engine supports only a narrow XPath 1.0
+subset, while the Mac2 driver evaluates XPath server-side with a complete
+engine. The per-driver list lives on the DriverDialect (see
+xgen/core/driver_dialect.py); the Windows list stays the default so nothing
+changes for existing callers.
 """
 
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import List, Optional
+
+from xgen.core.driver_dialect import DEFAULT_DIALECT, DriverDialect
 
 
 class AppiumXPathCompatLayer:
@@ -14,26 +22,26 @@ class AppiumXPathCompatLayer:
 
     # Disallowed unbounded or unsupported axes/functions in Appium Windows Driver XPath 1.0 engine
     DISALLOWED_PATTERNS: List[re.Pattern] = [
-        re.compile(r"(?<!-)following::", re.IGNORECASE),
-        re.compile(r"(?<!-)preceding::", re.IGNORECASE),
-        re.compile(r"\bancestor::", re.IGNORECASE),
-        re.compile(r"\bmatches\(", re.IGNORECASE),
-        re.compile(r"\blower-case\(", re.IGNORECASE),
-        re.compile(r"\bupper-case\(", re.IGNORECASE),
-        re.compile(r"\bends-with\(", re.IGNORECASE),
-        re.compile(r"\breplace\(", re.IGNORECASE),
+        re.compile(p, re.IGNORECASE) for p in DEFAULT_DIALECT.disallowed_xpath_patterns
     ]
 
     @classmethod
-    def is_appium_compatible(cls, xpath: str) -> bool:
+    def _patterns_for(cls, dialect: Optional[DriverDialect]) -> List[re.Pattern]:
+        if dialect is None or dialect is DEFAULT_DIALECT:
+            return cls.DISALLOWED_PATTERNS
+        return [re.compile(p, re.IGNORECASE) for p in dialect.disallowed_xpath_patterns]
+
+    @classmethod
+    def is_appium_compatible(cls, xpath: str, dialect: Optional[DriverDialect] = None) -> bool:
         """
-        Check if the given XPath selector is supported by Appium Windows Driver (WinAppDriver).
+        Check if the given XPath selector is supported by the target driver's
+        XPath engine (Appium Windows Driver / WinAppDriver by default).
         """
         if not xpath or not xpath.strip():
             return False
 
         # Reject unsupported functions or unbounded axes
-        for pattern in cls.DISALLOWED_PATTERNS:
+        for pattern in cls._patterns_for(dialect):
             if pattern.search(xpath):
                 return False
 

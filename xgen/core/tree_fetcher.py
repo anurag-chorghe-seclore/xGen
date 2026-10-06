@@ -112,6 +112,9 @@ class TreeFetcher(QObject):
         self.session_manager = session_manager
         self.config = config
         self._is_fetching = False
+        # A user-initiated refresh that arrived mid-fetch, to be run as soon as
+        # the in-flight one lands. See fetch_full() for why it isn't dropped.
+        self._queued_handle: Optional[str] = None
 
         # Dedicated worker thread
         self._thread = QThread()
@@ -136,12 +139,23 @@ class TreeFetcher(QObject):
         self._thread.quit()
         self._thread.wait(2000)
 
-    def fetch_full(self, window_handle: str = "", force: bool = False) -> None:
+    def fetch_full(self, window_handle: str = "", force: bool = False, queue_if_busy: bool = False) -> None:
         """
         Initiate asynchronous Tier 3 full tree fetch for the given window handle.
+
+        `queue_if_busy` is for requests a *person* made (the Refresh button,
+        Ctrl/Cmd+R). Those must never be silently discarded: dropping one looks
+        exactly like a refresh that did nothing, which is why a second press
+        appeared to be needed. The window for this is widest right after
+        connecting, and wider still on macOS, where the first /source after
+        attaching waits on WebDriverAgent warming up.
         """
         if self._is_fetching and not force:
-            logger.debug("Tree fetch already in progress, ignoring duplicate request.")
+            if queue_if_busy:
+                self._queued_handle = window_handle
+                logger.debug("Tree fetch in progress; queued the requested refresh to run after it.")
+            else:
+                logger.debug("Tree fetch already in progress, ignoring duplicate request.")
             return
 
         handle = window_handle
@@ -157,6 +171,7 @@ class TreeFetcher(QObject):
         """Cancel ongoing fetch operation."""
         self._worker.cancel()
         self._is_fetching = False
+        self._queued_handle = None
 
     # --- Worker Signal Handlers ---
 
@@ -166,7 +181,18 @@ class TreeFetcher(QObject):
     def _on_finished(self, handle: str, raw_xml: str, root: UINode) -> None:
         self._is_fetching = False
         self.fetch_complete.emit(handle, raw_xml, root)
+        self._run_queued_fetch()
 
     def _on_failed(self, err: str) -> None:
         self._is_fetching = False
         self.fetch_failed.emit(err)
+        self._run_queued_fetch()
+
+    def _run_queued_fetch(self) -> None:
+        """Run a refresh that arrived while a fetch was already in flight."""
+        if self._queued_handle is None:
+            return
+        handle = self._queued_handle
+        self._queued_handle = None
+        logger.info("Running the refresh that was requested during the previous fetch.")
+        self.fetch_full(handle)

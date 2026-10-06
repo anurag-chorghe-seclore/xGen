@@ -10,6 +10,7 @@ from collections import deque
 import logging
 from typing import List, NamedTuple, Optional
 
+from xgen.core.driver_dialect import active_dialect
 from xgen.core.session_manager import SessionManager
 from xgen.core.tree_cache import WindowTreeCache
 from xgen.core.tree_parser import TreeParser, UINode
@@ -103,9 +104,9 @@ class ElementBridge:
 
             if px > 0 and py > 0:
                 node = TreeParser.find_deepest_at_point(root, px, py, tag=uia_element.control_type)
-                if node is None and uia_element.control_type in ("Edit", "Text", "Image", "Custom"):
+                if node is None and self._is_ambiguous_leaf_type(uia_element.control_type, root):
                     candidate = TreeParser.find_deepest_at_point(root, px, py, tag="")
-                    if candidate and candidate.tag in TreeParser.INTERACTIVE_TAGS and candidate.tag not in ("Window", "Pane", "AppiumAUT"):
+                    if candidate and candidate.is_interactive and not self._is_container_tag(candidate):
                         node = candidate
 
                 if node is not None:
@@ -146,6 +147,30 @@ class ElementBridge:
         return self._build_disambiguation_list(rect, cache.parsed_root)
 
     # --- Private Helpers ---
+
+    # Leaf types whose native hit often lands on an inner glyph/label rather
+    # than the control the user meant, so a tag-free re-search is worthwhile.
+    _AMBIGUOUS_LEAF_TYPES = {
+        "windows": {"Edit", "Text", "Image", "Custom"},
+        "mac2": {
+            "XCUIElementTypeStaticText", "XCUIElementTypeTextField",
+            "XCUIElementTypeImage", "XCUIElementTypeTextView", "XCUIElementTypeAny",
+        },
+    }
+
+    def _is_ambiguous_leaf_type(self, control_type: str, root: UINode) -> bool:
+        key = root.driver_dialect.key
+        return control_type in self._AMBIGUOUS_LEAF_TYPES.get(key, set())
+
+    @staticmethod
+    def _is_container_tag(node: UINode) -> bool:
+        """True for window/layout/root tags that should never win a hit-test re-search."""
+        dialect = node.driver_dialect
+        return (
+            node.tag == dialect.window_tag
+            or node.tag in dialect.noisy_container_tags
+            or node.tag in dialect.root_tags
+        )
 
     def _match_by_runtime_id(self, rt_id: str, root: UINode) -> Optional[UINode]:
         return TreeParser.find_by_runtime_id(root, rt_id)
@@ -195,14 +220,17 @@ class ElementBridge:
         return matches
 
     def _match_by_appium_refind(self, uia_el: UIAElement, session: SessionManager) -> Optional[str]:
-        # Construct temporary single-attribute XPath
+        # Construct temporary single-attribute XPath in the active driver's
+        # own vocabulary — this one is sent to the driver, so @AutomationId
+        # would simply never match on a Mac session.
+        dialect = active_dialect()
         temp_xpath = ""
-        if uia_el.automation_id and not uia_el.automation_id.isdigit():
+        if uia_el.automation_id and dialect.attr_automation_id and not uia_el.automation_id.isdigit():
             esc = escape_xpath_literal(uia_el.automation_id)
-            temp_xpath = f"//*[@AutomationId={esc}]"
-        elif uia_el.name:
+            temp_xpath = f"//*[@{dialect.attr_automation_id}={esc}]"
+        elif uia_el.name and dialect.attr_name:
             esc = escape_xpath_literal(uia_el.name)
-            temp_xpath = f"//{uia_el.control_type}[@Name={esc}]"
+            temp_xpath = f"//{uia_el.control_type}[@{dialect.attr_name}={esc}]"
 
         if temp_xpath:
             return session.find_element_by_xpath(temp_xpath)
@@ -219,24 +247,46 @@ class ElementBridge:
         return matches
 
     def _create_synthetic_uinode(self, el: UIAElement) -> UINode:
-        """Create a detached UINode directly from native UIAElement properties."""
-        attrs = {
-            "ControlType": el.control_type,
-            "AutomationId": el.automation_id,
-            "Name": el.name,
-            "ClassName": el.class_name,
-            "IsEnabled": str(el.is_enabled),
-            "RuntimeId": el.runtime_id,
-            "HelpText": el.help_text,
-            "AriaProperties": el.aria_properties,
-        }
+        """
+        Create a detached UINode directly from native element properties.
+
+        Attributes are written in the active driver's own vocabulary, because
+        selectors generated from this node are sent to that driver: a Mac
+        fallback node carrying @Name/@AutomationId would produce selectors
+        that match nothing against Mac2Driver's source.
+        """
+        dialect = active_dialect()
+        attrs = {}
+
+        def _put(attr_name: str, value: str) -> None:
+            if attr_name and value:
+                attrs[attr_name] = value
+
+        _put(dialect.attr_automation_id, el.automation_id)
+        _put(dialect.attr_name, el.name)
+        _put(dialect.attr_class_name, el.class_name)
+        _put(dialect.attr_enabled, str(el.is_enabled))
+        _put(dialect.attr_runtime_id, el.runtime_id)
+        _put(dialect.attr_help_text, el.help_text)
+        if el.aria_properties:
+            attrs["AriaProperties"] = el.aria_properties
+        attrs.setdefault("ControlType", el.control_type)
+
         if el.bounding_rect:
-            attrs["BoundingRectangle"] = f"[{el.bounding_rect.left},{el.bounding_rect.top}][{el.bounding_rect.right},{el.bounding_rect.bottom}]"
+            r = el.bounding_rect
+            if dialect.attr_bounding_rect:
+                attrs[dialect.attr_bounding_rect] = f"[{r.left},{r.top}][{r.right},{r.bottom}]"
+            elif dialect.attr_x:
+                attrs[dialect.attr_x] = str(r.left)
+                attrs[dialect.attr_y] = str(r.top)
+                attrs[dialect.attr_width] = str(r.width)
+                attrs[dialect.attr_height] = str(r.height)
 
         return UINode(
             tag=el.control_type,
             attributes=attrs,
             bounding_rect=el.bounding_rect,
             runtime_id=el.runtime_id,
-            is_transient=True
+            is_transient=True,
+            dialect=dialect,
         )

@@ -22,6 +22,8 @@ class RecentSession:
     app_path: str = ""
     app_top_level_window: str = ""
     appium_url: str = "http://127.0.0.1:4723"
+    app_bundle_id: str = ""
+    target_platform: str = ""
 
 
 @dataclass
@@ -29,6 +31,24 @@ class XGenConfig:
     appium_url: str = "http://127.0.0.1:4723"
     app_path: str = ""
     app_top_level_window: str = ""
+
+    # Which driver the Appium server on the other end is running.
+    # "" = decide from the machine xGen is running on; "windows" / "mac"
+    # pin it explicitly, which is what makes it possible to drive a remote
+    # Mac Appium server from a Windows box (and vice versa).
+    target_platform: str = ""
+    # macOS session targets: the app's bundle identifier (com.apple.TextEdit).
+    app_bundle_id: str = ""
+    # macOS: attach to the app as it already is instead of relaunching it
+    # (maps to Mac2Driver's appium:noReset).
+    attach_to_running: bool = False
+    # Free-form Appium capabilities as a JSON object, merged into the session's
+    # alwaysMatch block last so they can override anything xGen sets. Keeps
+    # driver-specific options (appium:arguments, appium:environment,
+    # appium:prerun, appium:appLocale, webDriverAgentMacUrl, ...) reachable
+    # without xGen needing to model each one.
+    extra_capabilities: str = ""
+
     implicit_wait_ms: int = 0
     auto_detect_new_windows: bool = True
     auto_connect_on_startup: bool = True
@@ -87,6 +107,8 @@ class ConfigManager:
                     app_path=s.get("app_path", ""),
                     app_top_level_window=s.get("app_top_level_window", ""),
                     appium_url=s.get("appium_url", "http://127.0.0.1:4723"),
+                    app_bundle_id=s.get("app_bundle_id", ""),
+                    target_platform=s.get("target_platform", ""),
                 )
                 for s in recent_sessions_raw
                 if isinstance(s, dict)
@@ -96,6 +118,10 @@ class ConfigManager:
                 appium_url=data.get("appium_url", "http://127.0.0.1:4723"),
                 app_path=data.get("app_path", ""),
                 app_top_level_window=data.get("app_top_level_window", ""),
+                target_platform=data.get("target_platform", ""),
+                app_bundle_id=data.get("app_bundle_id", ""),
+                attach_to_running=bool(data.get("attach_to_running", False)),
+                extra_capabilities=data.get("extra_capabilities", "") or "",
                 implicit_wait_ms=int(data.get("implicit_wait_ms", 0)),
                 auto_detect_new_windows=bool(data.get("auto_detect_new_windows", True)),
                 auto_connect_on_startup=bool(data.get("auto_connect_on_startup", True)),

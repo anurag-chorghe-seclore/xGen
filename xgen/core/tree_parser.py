@@ -1,6 +1,12 @@
 """
 XML UI Tree Parser and in-memory hierarchical UINode representation.
-Normalizes attributes across Appium Windows Driver and legacy WinAppDriver.
+
+Attribute names are kept exactly as the driver spelled them — a node parsed
+from Appium's Mac2 driver keeps @label/@identifier, not Windows' @Name /
+@AutomationId — because every generated XPath is evaluated by that same
+driver against that same XML, so renaming here would silently break the
+round trip. Reading a value by meaning ("this element's name") goes through
+the active DriverDialect instead; see xgen/core/driver_dialect.py.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from lxml import etree
 
+from xgen.core.driver_dialect import DEFAULT_DIALECT, DriverDialect, active_dialect
 from xgen.utils.rect import Rect
 
 logger = logging.getLogger("xgen.parser")
@@ -37,6 +44,10 @@ class UINode:
     is_transient: bool = False
     captured_at: Optional[datetime.datetime] = None
     bridge_confidence: float = 1.0           # 0.0 - 1.0 confidence score from ElementBridge
+    # Which driver's vocabulary this node's attributes are written in. None
+    # means the Windows dialect, so every node built before dialects existed
+    # (and every test that constructs one by hand) behaves exactly as before.
+    dialect: Optional[DriverDialect] = None
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, UINode):
@@ -47,32 +58,62 @@ class UINode:
         return id(self)
 
     @property
+    def driver_dialect(self) -> DriverDialect:
+        """This node's driver vocabulary (Windows by default, for hand-built nodes)."""
+        return self.dialect or DEFAULT_DIALECT
+
+    @property
+    def _dialect(self) -> DriverDialect:
+        return self.driver_dialect
+
+    def _attr_by_role(self, attr_name: str, default: str = "") -> str:
+        """Read an attribute the dialect names, tolerating dialects that have no equivalent."""
+        if not attr_name:
+            return default
+        return self.attributes.get(attr_name, default)
+
+    @property
     def automation_id(self) -> str:
-        return self.attributes.get("AutomationId", "")
+        return self._attr_by_role(self._dialect.attr_automation_id)
 
     @property
     def name(self) -> str:
-        return self.attributes.get("Name", "")
+        value, _attr = self._dialect.name_of(self.attributes)
+        return value
+
+    @property
+    def name_attr(self) -> str:
+        """
+        Which attribute this node's name actually came from — the generator
+        needs it so a Mac element named only by @title yields a @title
+        selector rather than an @label one that would match nothing.
+        """
+        _value, attr = self._dialect.name_of(self.attributes)
+        return attr or self._dialect.attr_name
 
     @property
     def class_name(self) -> str:
-        return self.attributes.get("ClassName", "")
+        return self._attr_by_role(self._dialect.attr_class_name)
 
     @property
     def is_enabled(self) -> bool:
-        return self.attributes.get("IsEnabled", "true").lower() == "true"
+        return self._attr_by_role(self._dialect.attr_enabled, "true").lower() == "true"
 
     @property
     def is_offscreen(self) -> bool:
-        return self.attributes.get("IsOffscreen", "false").lower() == "true"
+        return self._attr_by_role(self._dialect.attr_offscreen, "false").lower() == "true"
 
     @property
     def help_text(self) -> str:
-        return self.attributes.get("HelpText", "")
+        return self._attr_by_role(self._dialect.attr_help_text)
 
     @property
     def aria_properties(self) -> str:
         return self.attributes.get("AriaProperties", "")
+
+    @property
+    def is_interactive(self) -> bool:
+        return self.tag in self._dialect.interactive_tags
 
     @property
     def child_count(self) -> int:
@@ -80,10 +121,10 @@ class UINode:
 
     def is_within_repeating_container(self) -> bool:
         """Check if this element or any of its ancestors sits inside a list/table/datagrid."""
-        REPEATING_TAGS = {"List", "ListView", "DataGrid", "Table", "ListBox", "Tree", "TreeView", "ItemsControl"}
+        repeating_tags = self._dialect.repeating_container_tags
         curr = self.parent
         while curr:
-            if curr.tag in REPEATING_TAGS:
+            if curr.tag in repeating_tags:
                 return True
             curr = curr.parent
         return False
@@ -105,36 +146,25 @@ class UINode:
 class TreeParser:
     """Parses raw driver XML into navigable UINode trees."""
 
-    ATTR_ALIASES: Dict[str, str] = {
-        "automationid": "AutomationId",
-        "automation-id": "AutomationId",
-        "classname": "ClassName",
-        "class-name": "ClassName",
-        "controltype": "ControlType",
-        "boundingrectangle": "BoundingRectangle",
-        "bounding-rectangle": "BoundingRectangle",
-        "isenabled": "IsEnabled",
-        "is-enabled": "IsEnabled",
-        "isoffscreen": "IsOffscreen",
-        "is-offscreen": "IsOffscreen",
-        "runtimeid": "RuntimeId",
-        "runtime-id": "RuntimeId",
-        "name": "Name",
-        "helptext": "HelpText",
-        "help-text": "HelpText",
-        "ariaproperties": "AriaProperties",
-        "aria-properties": "AriaProperties",
-    }
+    # Kept as a class attribute for backwards compatibility (and because the
+    # Windows dialect is still the default); the authoritative copy now lives
+    # on the dialect, so a non-Windows driver's attributes are never renamed.
+    ATTR_ALIASES: Dict[str, str] = dict(DEFAULT_DIALECT.attr_aliases)
 
     ROOT_TAGS = {"AppiumAUT", "Page", "XCUIElementTypeApplication", "Root"}
 
     @classmethod
-    def parse(cls, raw_xml: str) -> UINode:
+    def parse(cls, raw_xml: str, dialect: Optional[DriverDialect] = None) -> UINode:
         """
         Parse raw XML into a root UINode with precalculated depths, indices, and bounds.
+
+        `dialect` defaults to the active session's driver dialect, so callers
+        that don't care (most of them) keep working unchanged.
         """
         if not raw_xml or not raw_xml.strip():
             raise TreeParseError("Cannot parse empty XML string.")
+
+        resolved = dialect or active_dialect()
 
         try:
             # Parse with lxml
@@ -143,26 +173,37 @@ class TreeParser:
             if root_elem is None:
                 raise TreeParseError("XML parser returned null element.")
 
-            return cls._build_node_recursive(root_elem, parent=None, depth=0)
+            return cls._build_node_recursive(root_elem, parent=None, depth=0, dialect=resolved)
         except Exception as e:
             if isinstance(e, TreeParseError):
                 raise
             raise TreeParseError(f"Failed to parse XML: {e}") from e
 
     @classmethod
-    def _build_node_recursive(cls, elem: etree._Element, parent: Optional[UINode], depth: int) -> UINode:
+    def _build_node_recursive(
+        cls,
+        elem: etree._Element,
+        parent: Optional[UINode],
+        depth: int,
+        dialect: Optional[DriverDialect] = None,
+    ) -> UINode:
+        resolved = dialect or DEFAULT_DIALECT
+
         # Strip namespace if present: e.g. "{http://...}Button" -> "Button"
         raw_tag = elem.tag
         tag = raw_tag.split("}")[-1] if "}" in raw_tag else raw_tag
 
-        # Normalize attribute keys
+        # Normalize attribute keys, but only through this dialect's own alias
+        # table — renaming a driver's attributes to another driver's spelling
+        # would make every generated selector miss against the live app.
+        aliases = resolved.attr_aliases
         attrs: Dict[str, str] = {}
         for k, v in elem.attrib.items():
-            norm_k = cls.ATTR_ALIASES.get(k.lower(), k)
+            norm_k = aliases.get(k.lower(), k) if aliases else k
             attrs[norm_k] = str(v)
 
-        bounding_rect = Rect.from_appium_string(attrs.get("BoundingRectangle", ""))
-        runtime_id = attrs.get("RuntimeId", "")
+        bounding_rect = resolved.parse_bounds(attrs)
+        runtime_id = attrs.get(resolved.attr_runtime_id, "") if resolved.attr_runtime_id else ""
 
         node = UINode(
             tag=tag,
@@ -171,7 +212,8 @@ class TreeParser:
             parent=parent,
             depth=depth,
             bounding_rect=bounding_rect,
-            runtime_id=runtime_id
+            runtime_id=runtime_id,
+            dialect=resolved,
         )
 
         # Build children with correct sibling indices
@@ -185,7 +227,7 @@ class TreeParser:
             child_tag = child_elem.tag.split("}")[-1] if "}" in child_elem.tag else child_elem.tag
             tag_counts[child_tag] = tag_counts.get(child_tag, 0) + 1
 
-            child_node = cls._build_node_recursive(child_elem, parent=node, depth=depth + 1)
+            child_node = cls._build_node_recursive(child_elem, parent=node, depth=depth + 1, dialect=resolved)
             child_node.sibling_index = idx
             child_node.child_index = tag_counts[child_tag]
             child_nodes.append(child_node)
@@ -266,11 +308,9 @@ class TreeParser:
 
         return matches
 
-    INTERACTIVE_TAGS = {
-        "Button", "MenuItem", "TabItem", "CheckBox", "RadioButton",
-        "Hyperlink", "ComboBox", "Edit", "ListItem", "TreeItem",
-        "HeaderItem", "Slider", "ScrollBar", "Spinner", "ProgressBar"
-    }
+    # Back-compat alias for the Windows set; prefer UINode.is_interactive,
+    # which asks the node's own dialect (XCUIElementTypeButton on Mac).
+    INTERACTIVE_TAGS = set(DEFAULT_DIALECT.interactive_tags)
 
     @classmethod
     def find_deepest_at_point(cls, root: UINode, x: int, y: int, tag: str = "") -> Optional[UINode]:
@@ -296,7 +336,7 @@ class TreeParser:
 
         # Prioritize interactive controls (Button, Tab, MenuItem) over inner text/glyph children or outer panes
         def score_candidate(n: UINode):
-            is_interactive = 0 if n.tag in cls.INTERACTIVE_TAGS else 1
+            is_interactive = 0 if n.is_interactive else 1
             area = n.bounding_rect.area if n.bounding_rect else 99999999
             return (is_interactive, area, -n.depth)
 

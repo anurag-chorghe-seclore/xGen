@@ -1,10 +1,15 @@
 """
-Appium Windows Driver Session Manager.
+Appium Session Manager (Windows Driver / WinAppDriver and macOS Mac2 Driver).
 Maintains session lifecycle, window handles, heartbeats, and REST communication.
+
+Which driver is on the other end is decided per session, not per machine —
+see xgen/core/driver_dialect.py — because the Appium server URL is
+user-configurable and may well be a Mac reached from a Windows box.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -16,6 +21,12 @@ import requests
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot, Qt
 
 from xgen.config import XGenConfig
+from xgen.core.driver_dialect import (
+    DriverDialect,
+    DriverDialectStore,
+    dialect_for_platform,
+    dialect_from_capabilities,
+)
 
 logger = logging.getLogger("xgen.session")
 
@@ -121,6 +132,12 @@ class SessionManager(QObject):
         self._heartbeat_failures: int = 0
         self._disconnect_requested: bool = False
         self._delete_thread: Optional[threading.Thread] = None
+        # Heartbeat probes, tried in order. A driver that answers "unknown
+        # command" for one is moved to the next rather than being treated as
+        # a dead session — Mac2Driver has no window handles, and reporting a
+        # healthy session as LOST every 90s would be worse than not probing.
+        self._heartbeat_probes: List[str] = ["window/handles", "timeouts"]
+        self._heartbeat_probe_index: int = 0
 
         # Threading for background execution
         self._worker_thread = QThread()
@@ -184,6 +201,20 @@ class SessionManager(QObject):
         except Exception as e:
             return (False, f"Status check failed: {e}")
 
+    @staticmethod
+    def resolve_dialect(config: XGenConfig) -> DriverDialect:
+        """
+        Pick the driver dialect for a session that hasn't started yet: the
+        user's explicit choice if they made one, otherwise the OS xGen is
+        running on (asked of the platform backend so this module stays free
+        of platform branching). Once the server answers, its own reported
+        capabilities take over — see _create_session.
+        """
+        if config.target_platform:
+            return dialect_for_platform(config.target_platform)
+        from xgen.platform.factory import get_platform_backend
+        return dialect_for_platform(get_platform_backend().default_driver_platform())
+
     def connect(self, config: XGenConfig) -> None:
         """Asynchronously connect to or start an Appium session."""
         if self.state == SessionState.CONNECTING:
@@ -195,6 +226,14 @@ class SessionManager(QObject):
         self._disconnect_requested = False
         self.current_config = config
         self._base_url = config.appium_url.rstrip("/")
+        self._heartbeat_probe_index = 0
+
+        # Activate the dialect before anything parses a tree or builds a
+        # selector for this session.
+        dialect = self.resolve_dialect(config)
+        DriverDialectStore.instance().set_active(dialect)
+        logger.info("Session target: %s", dialect.display_name)
+
         self._set_state(SessionState.CONNECTING)
         # Dispatch to worker thread via queued signal
         self._req_connect.emit(config)
@@ -307,10 +346,13 @@ class SessionManager(QObject):
 
     def _create_session(self, config: XGenConfig) -> SessionInfo:
         base = config.appium_url.rstrip("/")
+        dialect = self.resolve_dialect(config)
+        is_mac = dialect.key == "mac2"
 
         # Construct Appium 2 / W3C capabilities with JSONWP backwards compatibility
         app_target = config.app_path.strip()
         app_window = config.app_top_level_window.strip()
+        bundle_id = (config.app_bundle_id or "").strip()
 
         # 1. First wait for any in-flight session deletion thread to finish before touching server
         if self._delete_thread and self._delete_thread.is_alive():
@@ -331,38 +373,53 @@ class SessionManager(QObject):
                     sid = first_sess.get("id") or first_sess.get("sessionId")
                     if sid:
                         caps = first_sess.get("capabilities", {})
-                        existing_app = (caps.get("appium:app") or caps.get("app") or "").strip()
-                        existing_window_cap = (
-                            caps.get("appium:appTopLevelWindow")
-                            or caps.get("appTopLevelWindow")
-                            or ""
-                        )
 
-                        # Determine if reuse is appropriate
-                        user_wants_root = not app_target and not app_window
-                        existing_is_root = existing_app in ("Root", "", "root")
-                        existing_is_window = bool(existing_window_cap)
-
-                        try:
-                            same_app = (
-                                existing_app
-                                and app_target
-                                and Path(existing_app).resolve() == Path(app_target).resolve()
+                        # Never reuse a session belonging to a different driver
+                        # (a leftover Windows session when the user now wants a
+                        # Mac one would otherwise look reusable).
+                        existing_dialect = dialect_from_capabilities(caps)
+                        if existing_dialect is not None and existing_dialect.key != dialect.key:
+                            should_reuse = False
+                            existing_app = ""
+                        elif is_mac:
+                            existing_bundle = (caps.get("appium:bundleId") or caps.get("bundleId") or "").strip()
+                            existing_app_path = (caps.get("appium:appPath") or caps.get("appPath") or "").strip()
+                            existing_app = existing_bundle or existing_app_path
+                            wanted = bundle_id or app_target
+                            should_reuse = bool(wanted) and wanted in (existing_bundle, existing_app_path)
+                        else:
+                            existing_app = (caps.get("appium:app") or caps.get("app") or "").strip()
+                            existing_window_cap = (
+                                caps.get("appium:appTopLevelWindow")
+                                or caps.get("appTopLevelWindow")
+                                or ""
                             )
-                        except (OSError, ValueError):
-                            same_app = existing_app == app_target
 
-                        same_window = (
-                            bool(app_window)
-                            and existing_is_window
-                            and normalize_handle(existing_window_cap) == normalize_handle(app_window)
-                        )
+                            # Determine if reuse is appropriate
+                            user_wants_root = not app_target and not app_window
+                            existing_is_root = existing_app in ("Root", "", "root")
+                            existing_is_window = bool(existing_window_cap)
 
-                        should_reuse = (
-                            (user_wants_root and existing_is_root)
-                            or same_app
-                            or same_window
-                        )
+                            try:
+                                same_app = (
+                                    existing_app
+                                    and app_target
+                                    and Path(existing_app).resolve() == Path(app_target).resolve()
+                                )
+                            except (OSError, ValueError):
+                                same_app = existing_app == app_target
+
+                            same_window = (
+                                bool(app_window)
+                                and existing_is_window
+                                and normalize_handle(existing_window_cap) == normalize_handle(app_window)
+                            )
+
+                            should_reuse = (
+                                (user_wants_root and existing_is_root)
+                                or same_app
+                                or same_window
+                            )
 
                         if should_reuse:
                             logger.info("Reusing compatible Appium session: %s (app: %s)", sid, existing_app or "Root")
@@ -405,48 +462,99 @@ class SessionManager(QObject):
         except Exception as e:
             logger.debug("Active sessions query note: %s", e)
 
-        if not app_target and not app_window:
-            # Default to Desktop Root if nothing specified
-            app_target = "Root"
-
-        # Appium 2 W3C compliant capabilities
         w3c_caps: Dict[str, Any] = {
-            "platformName": "Windows",
-            "appium:automationName": "Windows",
+            "platformName": dialect.platform_name,
+            "appium:automationName": dialect.automation_name,
             "appium:newCommandTimeout": 3600,
         }
 
-        app_name = "Desktop Root"
-        if app_window:
-            w3c_caps["appium:appTopLevelWindow"] = app_window
-            try:
-                norm_target = normalize_handle(app_window)
-                for w in get_open_windows():
-                    if w.hwnd and normalize_handle(w.hwnd) == norm_target:
-                        app_name = w.title or w.exe_name or f"Window {app_window}"
-                        break
-                else:
-                    app_name = f"Window {app_window}"
-            except Exception:
-                app_name = f"Window {app_window}"
-        else:
-            w3c_caps["appium:app"] = app_target
-            if app_target and app_target != "Root":
+        if is_mac:
+            # XCUITest sessions are always scoped to one application — macOS has
+            # no equivalent of WinAppDriver's desktop-wide "Root" target, so a
+            # Mac session always names an app. Mac2Driver would silently default
+            # to Finder; name it explicitly instead so the UI tells the truth
+            # about what the tree belongs to.
+            if app_target and not bundle_id and app_target != "Root":
+                w3c_caps["appium:appPath"] = app_target
                 app_name = Path(app_target).stem
+            else:
+                effective_bundle = bundle_id
+                app_name = ""
+                if not effective_bundle:
+                    # Mac2Driver's own default is Finder, which is almost never
+                    # what someone wants to inspect. Target the frontmost app
+                    # instead — the first entry the platform backend reports.
+                    try:
+                        running = get_open_windows()
+                        frontmost = next((w for w in running if w.bundle_id), None)
+                        if frontmost is not None:
+                            effective_bundle = frontmost.bundle_id
+                            app_name = frontmost.title
+                            logger.info(
+                                "No macOS app specified; attaching to the frontmost app (%s).",
+                                effective_bundle,
+                            )
+                    except Exception as e:
+                        logger.debug("Could not determine the frontmost app: %s", e)
+                if not effective_bundle:
+                    effective_bundle = "com.apple.finder"
+                    logger.info("No running app could be identified; falling back to Finder.")
+                w3c_caps["appium:bundleId"] = effective_bundle
+                if not app_name:
+                    app_name = effective_bundle.split(".")[-1].title()
+            if config.attach_to_running:
+                # Attach to the app as it stands instead of restarting it.
+                w3c_caps["appium:noReset"] = True
+                w3c_caps["appium:skipAppKill"] = True
 
-        # Add non-prefixed desiredCapabilities for JSONWP / standalone WinAppDriver
-        jsonwp_caps = dict(w3c_caps)
-        for k, v in list(w3c_caps.items()):
-            if k.startswith("appium:"):
-                jsonwp_caps[k[7:]] = v
+            self._apply_extra_capabilities(w3c_caps, config)
 
-        payload = {
-            "capabilities": {
-                "alwaysMatch": w3c_caps,
-                "firstMatch": [{}]
-            },
-            "desiredCapabilities": jsonwp_caps
-        }
+            # Appium 2+ only; no legacy JSONWP peer exists for this driver, so
+            # the deprecated desiredCapabilities block is deliberately omitted.
+            payload = {
+                "capabilities": {
+                    "alwaysMatch": w3c_caps,
+                    "firstMatch": [{}]
+                }
+            }
+        else:
+            if not app_target and not app_window:
+                # Default to Desktop Root if nothing specified
+                app_target = "Root"
+
+            app_name = "Desktop Root"
+            if app_window:
+                w3c_caps["appium:appTopLevelWindow"] = app_window
+                try:
+                    norm_target = normalize_handle(app_window)
+                    for w in get_open_windows():
+                        if w.hwnd and normalize_handle(w.hwnd) == norm_target:
+                            app_name = w.title or w.exe_name or f"Window {app_window}"
+                            break
+                    else:
+                        app_name = f"Window {app_window}"
+                except Exception:
+                    app_name = f"Window {app_window}"
+            else:
+                w3c_caps["appium:app"] = app_target
+                if app_target and app_target != "Root":
+                    app_name = Path(app_target).stem
+
+            self._apply_extra_capabilities(w3c_caps, config)
+
+            # Add non-prefixed desiredCapabilities for JSONWP / standalone WinAppDriver
+            jsonwp_caps = dict(w3c_caps)
+            for k, v in list(w3c_caps.items()):
+                if k.startswith("appium:"):
+                    jsonwp_caps[k[7:]] = v
+
+            payload = {
+                "capabilities": {
+                    "alwaysMatch": w3c_caps,
+                    "firstMatch": [{}]
+                },
+                "desiredCapabilities": jsonwp_caps
+            }
 
         logger.info("Connecting to Appium at %s with payload: %s", base, payload)
         r = self._http_session.post(
@@ -472,6 +580,22 @@ class SessionManager(QObject):
         self._session_id = sid
         logger.info("Appium session established: %s", sid)
 
+        # The server's own reported capabilities are authoritative — if it
+        # negotiated a different driver than we assumed, follow it rather than
+        # parsing its XML with the wrong vocabulary.
+        value = resp_data.get("value")
+        server_caps = value.get("capabilities") if isinstance(value, dict) else None
+        if not isinstance(server_caps, dict) and isinstance(value, dict):
+            server_caps = value
+        confirmed = dialect_from_capabilities(server_caps if isinstance(server_caps, dict) else None)
+        if confirmed is not None and confirmed.key != dialect.key:
+            logger.info(
+                "Server negotiated %s (expected %s); switching dialect to match.",
+                confirmed.display_name, dialect.display_name,
+            )
+            dialect = confirmed
+        DriverDialectStore.instance().set_active(dialect)
+
         # Retrieve initial window handles
         windows = self._refresh_handles_internal()
         if not app_window and (not app_target or app_target == "Root"):
@@ -487,6 +611,41 @@ class SessionManager(QObject):
             active_handle=active_handle
         )
         return info
+
+    @staticmethod
+    def parse_extra_capabilities(raw: str) -> Dict[str, Any]:
+        """
+        Parse the user's custom-capability JSON from the Session dialog.
+
+        Raises ValueError with a readable message so the dialog can refuse to
+        connect rather than letting the driver reject a malformed session.
+        """
+        text = (raw or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Not valid JSON: {e.msg} (line {e.lineno}, column {e.colno})") from e
+        if not isinstance(parsed, dict):
+            raise ValueError("Capabilities must be a JSON object, e.g. {\"appium:showServerLogs\": true}")
+        return parsed
+
+    def _apply_extra_capabilities(self, caps: Dict[str, Any], config: XGenConfig) -> None:
+        """Merge the user's own capabilities in last, so they can override anything xGen set."""
+        raw = getattr(config, "extra_capabilities", "") or ""
+        try:
+            extra = self.parse_extra_capabilities(raw)
+        except ValueError as e:
+            # The dialog validates before connecting; reaching here means the
+            # value came from a stored config, so warn and carry on rather than
+            # failing the whole session over it.
+            logger.warning("Ignoring invalid custom capabilities: %s", e)
+            return
+        for key, value in extra.items():
+            if key in caps and caps[key] != value:
+                logger.info("Custom capability overrides %s: %r -> %r", key, caps[key], value)
+            caps[key] = value
 
     def _fetch_source_internal(self, timeout_seconds: int = 60) -> str:
         if not self._session_id:
@@ -571,16 +730,47 @@ class SessionManager(QObject):
             logger.debug("Could not get window handles: %s", e)
         return []
 
+    # Error text that means "this driver doesn't implement that endpoint",
+    # as opposed to "your session is gone" — both arrive as HTTP 404 under
+    # the W3C spec, and telling them apart is what keeps a perfectly healthy
+    # Mac2 session (which has no window handles) from being declared LOST.
+    _UNSUPPORTED_ENDPOINT_MARKERS = (
+        "unknown command",
+        "not implemented",
+        "notimplemented",
+        "unsupported",
+        "did not match a known command",
+    )
+
     def _check_heartbeat(self) -> None:
         if not self._session_id or self.state != SessionState.CONNECTED:
             return
 
+        if self._heartbeat_probe_index >= len(self._heartbeat_probes):
+            return  # no probe this driver understands; heartbeat disabled
+
+        probe = self._heartbeat_probes[self._heartbeat_probe_index]
+
         def _ping():
             try:
-                # Use /window/handles for universal heartbeat ping (supported on Root, App, and attached sessions)
-                r = self._http_session.get(f"{self._base_url}/session/{self._session_id}/window/handles", timeout=10.0)
+                r = self._http_session.get(f"{self._base_url}/session/{self._session_id}/{probe}", timeout=10.0)
                 if r.status_code == 200:
                     self._heartbeat_failures = 0
+                elif r.status_code in (404, 405, 501) and any(
+                    m in r.text.lower() for m in self._UNSUPPORTED_ENDPOINT_MARKERS
+                ):
+                    self._heartbeat_probe_index += 1
+                    self._heartbeat_failures = 0
+                    if self._heartbeat_probe_index < len(self._heartbeat_probes):
+                        logger.info(
+                            "Heartbeat probe '%s' isn't supported by this driver; falling back to '%s'.",
+                            probe, self._heartbeat_probes[self._heartbeat_probe_index],
+                        )
+                    else:
+                        logger.info(
+                            "No supported heartbeat endpoint on this driver; disabling heartbeat "
+                            "(session loss will surface on the next real request instead)."
+                        )
                 elif r.status_code == 404:
                     logger.warning("Heartbeat: session expired or closed on server (HTTP 404). Session lost.")
                     self._set_state(SessionState.LOST)
