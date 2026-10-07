@@ -33,6 +33,7 @@ from xgen.capture.mouse_hook import MouseHook
 from xgen.capture.overlay_window import OverlayWindow
 from xgen.capture.transient_capture import TransientCapturer
 from xgen.config import ConfigManager, XGenConfig
+from xgen.core.driver_dialect import active_dialect
 from xgen.core.driver_runner import DriverRunner
 from xgen.core.element_bridge import ElementBridge
 from xgen.core.session_manager import SessionManager, SessionState, WindowInfo
@@ -113,6 +114,8 @@ class MainWindow(QMainWindow):
         self.key_hook = GlobalKeyHook(self)
         self.inspect_mode = InspectMode(self.config, overlay=self.overlay, mouse_hook=self.mouse_hook, parent=self)
         self.inspect_mode.set_window_filter(self._is_point_outside_xgen)
+        self._scope_pid: Optional[int] = None
+        self._scope_app_name: str = ""
         self.transient_capturer = TransientCapturer(parent=self)
 
         # 3. Instantiate UI Panels
@@ -257,6 +260,7 @@ class MainWindow(QMainWindow):
         # pynput threads start consulting them (mode_changed is emitted on the
         # GUI thread by InspectMode.activate/deactivate).
         self.inspect_mode.mode_changed.connect(lambda _active: self.refresh_hover_filter_snapshot())
+        self.inspect_mode.scope_changed.connect(self._on_inspect_scope_changed)
         self.key_hook.f4_pressed.connect(self._on_f4_freeze_shortcut)
         self.key_hook.esc_pressed.connect(self.inspect_mode.deactivate)
         self.key_hook.ctrl_r_pressed.connect(self._on_refresh_requested)
@@ -577,10 +581,87 @@ class MainWindow(QMainWindow):
         # it decides which selector controls are meaningful (see
         # XPathPanel.apply_driver_dialect).
         self.xpath_panel.apply_driver_dialect()
+        self._apply_inspect_scope()
         target_handle = info.active_handle or self.config.app_top_level_window
         self._refresh_window_picker(selected_handle=target_handle)
         # Auto-fetch tree on session connect (force new fetch)
         self.tree_fetcher.fetch_full(target_handle, force=True)
+
+    def _apply_inspect_scope(self) -> None:
+        """Limit Inspect Mode to the attached application, where that is what a session means.
+
+        An Appium Mac2 session covers exactly one application; the system-wide
+        accessibility hit-test behind element_from_point does not know that, so
+        hovering another app highlighted elements that could never be in the
+        fetched tree and that no selector from this session could address. That
+        is only confusing, so outside the attached app Inspect Mode now
+        resolves nothing.
+
+        Keyed off the *driver* rather than sys.platform, like the rest of the
+        dialect work: a Windows Desktop Root session genuinely does target the
+        whole desktop and must keep inspecting everything, and xGen on Windows
+        driving a remote Mac server should still scope.
+        """
+        dialect = active_dialect()
+        if getattr(dialect, "supports_desktop_root_sessions", None) is None:
+            app_scoped = dialect.key == "mac2"
+        else:  # pragma: no cover - forward compatibility with new dialects
+            app_scoped = not dialect.supports_desktop_root_sessions
+
+        if not app_scoped:
+            self.inspect_mode.set_scope_filter(None)
+            self._scope_pid = None
+            return
+
+        pid = self._target_process_id()
+        if not pid:
+            # Fail open: an inspector that silently resolves nothing is far
+            # worse than one that occasionally resolves too much.
+            logger.info("Could not resolve the attached application's pid; Inspect Mode stays unscoped.")
+            self.inspect_mode.set_scope_filter(None)
+            self._scope_pid = None
+            return
+
+        self._scope_pid = pid
+        logger.info("Inspect Mode scoped to pid %s (%s).", pid, self._scope_app_name or "attached app")
+
+        def _in_attached_app(x: int, y: int) -> bool:
+            try:
+                return get_platform_backend().process_id_at_point(x, y) == self._scope_pid
+            except Exception:
+                return True  # never let a failed probe kill Inspect Mode
+
+        self.inspect_mode.set_scope_filter(_in_attached_app)
+
+    def _target_process_id(self) -> Optional[int]:
+        """Pid of the application this session is attached to, if we can tell."""
+        bundle_id = getattr(self.config, "app_bundle_id", "") or ""
+        info = self.session_manager.session_info
+        app_name = (getattr(info, "app_name", "") if info else "") or ""
+        self._scope_app_name = app_name or bundle_id
+
+        targets = getattr(self, "_last_window_targets", []) or []
+        if bundle_id:
+            for w in targets:
+                if getattr(w, "bundle_id", "") == bundle_id and getattr(w, "pid", 0):
+                    return int(w.pid)
+        if app_name:
+            for w in targets:
+                if getattr(w, "title", "") == app_name and getattr(w, "pid", 0):
+                    return int(w.pid)
+        return None
+
+    def _on_inspect_scope_changed(self, in_scope: bool) -> None:
+        """Say why nothing is highlighting, rather than letting it look broken."""
+        if not self.inspect_mode.is_active:
+            return
+        if in_scope:
+            self.status_bar.lbl_msg.setText("🔍 Inspect Mode — hover an element.")
+        else:
+            name = self._scope_app_name or "the attached application"
+            self.status_bar.lbl_msg.setText(
+                f"🔍 Outside {name} — this session can only inspect {name}."
+            )
 
     def _on_session_error(self, err: str) -> None:
         title, friendly_msg, tech_details = format_session_error(err)

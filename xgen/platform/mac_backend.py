@@ -561,6 +561,7 @@ class MacBackend:
                 # identifier the session will actually be started with.
                 exe_name=bundle_id,
                 bundle_id=bundle_id,
+                pid=int(pid),
             ))
 
         return found
@@ -612,6 +613,18 @@ class MacBackend:
                 if not hits:
                     return None
                 return int(hits[0].get("kCGWindowNumber", 0))
+        except Exception:
+            return None
+
+    def process_id_at_point(self, x: int, y: int) -> Optional[int]:
+        if not HAS_QUARTZ:
+            return None
+        try:
+            with self._autorelease_pool():
+                hits = self._windows_at_point(float(x), float(y))
+                if not hits:
+                    return None
+                return int(hits[0].get("kCGWindowOwnerPID", 0)) or None
         except Exception:
             return None
 

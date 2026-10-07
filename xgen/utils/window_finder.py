@@ -25,6 +25,10 @@ class WindowTarget:
     # Appium's Mac2 driver targets an application, not a window handle, so
     # this is what a picked window turns into when starting a Mac session.
     bundle_id: str = ""
+    # Owning process id. On macOS this is how Inspect Mode tells whether the
+    # element under the cursor belongs to the application the session is
+    # attached to, since a Mac2 session covers exactly one app.
+    pid: int = 0
 
     def display_label(self) -> str:
         if self.is_root:

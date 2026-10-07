@@ -30,6 +30,7 @@ class InspectMode(QObject):
     mode_changed = pyqtSignal(bool)           # True=active, False=idle
     hovering = pyqtSignal(object)             # UIAElement
     element_clicked = pyqtSignal(object, int, int)  # UIAElement, click_x, click_y
+    scope_changed = pyqtSignal(bool)          # True=cursor is inside the attached target
 
     # How many consecutive empty hover resolutions it takes to drop the
     # highlight. See _empty_ticks in __init__.
@@ -50,6 +51,10 @@ class InspectMode(QObject):
         self._is_active = False
         self._last_uia_el: Optional[UIAElement] = None
         self._window_filter: Optional[Callable[[int, int], bool]] = None
+        # Optional second filter: is the cursor over the application this
+        # session is actually attached to? See set_scope_filter.
+        self._scope_filter: Optional[Callable[[int, int], bool]] = None
+        self._in_scope = True
         # Consecutive polls that resolved to nothing. The highlight is only
         # dropped once this passes EMPTY_TICKS_BEFORE_HIDE, so a single
         # unlucky hit-test — a window animating, a menu opening, the target
@@ -72,6 +77,22 @@ class InspectMode(QObject):
     def set_window_filter(self, filter_fn: Callable[[int, int], bool]) -> None:
         """Filter to exclude clicks/hovers over xGen's own UI windows."""
         self._window_filter = filter_fn
+
+    def set_scope_filter(self, filter_fn: Optional[Callable[[int, int], bool]]) -> None:
+        """Limit resolution to the application the session is attached to.
+
+        An Appium Mac2 session covers exactly one application, so an element in
+        any other app cannot be in the fetched tree and no XPath from this
+        session can address it. Highlighting one anyway invites the user to
+        click something xGen then cannot generate a selector for. With a scope
+        filter set, hovering outside the attached app resolves to nothing at
+        all, the same as hovering over empty desktop.
+
+        Pass None to inspect everything, which is what a Windows Desktop Root
+        session wants — there the whole desktop genuinely is the target.
+        """
+        self._scope_filter = filter_fn
+        self._in_scope = True
 
     def toggle(self) -> bool:
         """Toggle inspect mode between active and idle."""
@@ -134,6 +155,16 @@ class InspectMode(QObject):
             self._hide_after_empty_tick()
             return
 
+        # Outside the attached application: nothing here can be in this
+        # session's tree, so resolve nothing rather than highlight something
+        # the user cannot act on.
+        if self._scope_filter is not None and not self._scope_filter(x, y):
+            self._set_in_scope(False)
+            self._last_uia_el = None
+            self._hide_after_empty_tick()
+            return
+        self._set_in_scope(True)
+
         # 1. Check active cached XML tree for exact innermost leaf control
         cache = TreeCacheStore.instance().get_active()
         deepest_node = None
@@ -167,6 +198,12 @@ class InspectMode(QObject):
         else:
             self._hide_after_empty_tick()
 
+    def _set_in_scope(self, in_scope: bool) -> None:
+        """Announce scope transitions only, not every poll."""
+        if in_scope != self._in_scope:
+            self._in_scope = in_scope
+            self.scope_changed.emit(in_scope)
+
     def _hide_after_empty_tick(self) -> None:
         """Drop the highlight only once several polls in a row resolve to nothing."""
         self._empty_ticks += 1
@@ -176,6 +213,10 @@ class InspectMode(QObject):
     def _on_mouse_click(self, x: int, y: int) -> None:
         """Handle left-click event captured by global hook."""
         if not self._is_active:
+            return
+
+        if self._scope_filter is not None and not self._scope_filter(x, y):
+            logger.debug("Click at (%d, %d) is outside the attached application; ignored.", x, y)
             return
 
         target_el = self._last_uia_el

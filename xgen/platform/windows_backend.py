@@ -456,6 +456,10 @@ class WindowsBackend:
             return None
         return hwnd
 
+    def process_id_at_point(self, x: int, y: int) -> Optional[int]:
+        hwnd = self.window_from_point(x, y)
+        return self.get_process_id_for_window(hwnd) if hwnd else None
+
     def get_process_id_for_window(self, hwnd: int) -> Optional[int]:
         if not HAS_WIN32_WINDOW_APIS or not hwnd:
             return None

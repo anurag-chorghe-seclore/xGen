@@ -114,6 +114,15 @@ class PlatformBackend(Protocol):
         """Native window handle at (x, y), or None."""
         ...
 
+    def process_id_at_point(self, x: int, y: int) -> Optional[int]:
+        """Owning process of whatever is on screen at (x, y), or None if unknown.
+
+        Inspect Mode uses this to tell whether the thing under the cursor
+        belongs to the application the session is attached to. Our own
+        click-through overlay is never reported (see apply_click_through).
+        """
+        ...
+
     def get_process_id_for_window(self, hwnd: int) -> Optional[int]:
         """Owning process id for a window handle, or None."""
         ...
